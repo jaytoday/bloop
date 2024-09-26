@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "bloop",
-    "version": "0.4.4"
+    "version": "0.6.5"
   },
   "tauri": {
     "allowlist": {
@@ -59,20 +59,27 @@
       "macOS": {
         "entitlements": null,
         "exceptionDomain": "",
-        "frameworks": [],
+        "frameworks": [
+          "frameworks/libonnxruntime.dylib"
+        ],
         "providerShortName": null,
         "signingIdentity": null
       },
       "resources": [
-        "config.json",
-        "model/*"
+        "model/*",
+        "dylibs/*",
+        "config/config.json"
       ],
       "shortDescription": "",
       "targets": "all",
       "windows": {
-        "certificateThumbprint": null,
+        "certificateThumbprint": "b955de6f8483ad3b14497e798a6eef48a137931b",
         "digestAlgorithm": "sha256",
-        "timestampUrl": ""
+        "timestampUrl": "http://timestamp.sectigo.com",
+        "nsis": {
+          "installMode": "currentUser",
+          "template": "installer.nsi"
+        }
       }
     },
     "security": {
@@ -96,7 +103,8 @@
         "hiddenTitle": true,
         "titleBarStyle": "Overlay",
         "minHeight": 700,
-        "minWidth": 1000
+        "minWidth": 1000,
+        "fileDropEnabled": false
       }
     ]
   }

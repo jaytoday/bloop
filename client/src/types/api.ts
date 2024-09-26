@@ -1,4 +1,11 @@
-import { SymbolType, Range } from './results';
+import { SymbolType, Range, TokenInfoType } from './results';
+import {
+  DiffChunkType,
+  DiffHunkType,
+  RepoType,
+  StudioContextDoc,
+  StudioContextFile,
+} from './general';
 
 export interface RangeLine {
   byte: number;
@@ -73,6 +80,8 @@ export interface SearchResponseFile {
   repo_name: string;
   repo_ref: string;
   lang: string;
+  branches: string;
+  is_dir: boolean;
 }
 
 export interface FlagItem {
@@ -120,13 +129,13 @@ export interface Directory {
 export interface DirectoryFileEntryData {
   File: {
     lang: string;
+    indexed: boolean;
   };
 }
 
 export interface DirectoryEntry {
   name: string;
   entry_data: 'Directory' | DirectoryFileEntryData;
-  currentFile?: boolean;
 }
 
 export interface File {
@@ -136,6 +145,10 @@ export interface File {
   contents: string;
   repo_ref: string;
   siblings: DirectoryEntry[];
+  size: number;
+  loc: number;
+  sloc: number;
+  indexed: boolean;
 }
 
 export interface FileResponse {
@@ -183,23 +196,132 @@ export interface TokenInfoItem {
   data: TokenInfoDataItem[];
 }
 
+export type RefDefDataItem = {
+  kind: TokenInfoType;
+  range: {
+    start: {
+      byte: number;
+      line: number;
+      column: number;
+    };
+    end: {
+      byte: number;
+      line: number;
+      column: number;
+    };
+  };
+  snippet: {
+    data: string;
+    highlights: Range[];
+    tokenRange?: Range;
+    symbols: never[];
+    line_range: Range;
+  };
+};
+
 export interface TokenInfoResponse {
-  kind: 'reference' | 'definition';
-  references?: TokenInfoItem[];
-  definitions?: TokenInfoItem[];
+  data: {
+    file: string;
+    data: RefDefDataItem[];
+  }[];
 }
 
-export type AllConversationsResponse = {
+export type ConversationShortType = {
   created_at: number;
-  thread_id: string;
+  id: string;
   title: string;
-}[];
+  thread_id: string;
+};
+
+export type AllConversationsResponse = ConversationShortType[];
+
+type ProcStep = {
+  type: 'proc';
+  content: { query: string; paths: { repo: string; path: string }[] };
+};
+
+type CodeStep = {
+  type: 'code';
+  content: { query: string };
+};
+
+type PathStep = {
+  type: 'path';
+  content: { query: string };
+};
+
+export type SearchStepType = ProcStep | CodeStep | PathStep;
 
 export type ConversationType = {
-  finished: boolean;
-  search_steps: { content: string; type: string }[];
+  thread_id: string;
+  exchanges: ConversationExchangeType[];
+};
+
+export type ConversationExchangeType = {
+  id: string;
+  search_steps: SearchStepType[];
+  query: {
+    raw_query: string;
+    repos: {
+      Plain: { start: number; end: number; content: string };
+    }[];
+    paths: {
+      Plain: { start: number; end: number; content: string };
+    }[];
+    langs: {
+      Plain: {
+        start: number;
+        end: number;
+        content: string;
+      };
+    }[];
+    branch: {
+      Plain: {
+        start: number;
+        end: number;
+        content: string;
+      };
+    }[];
+    target: {
+      Plain: {
+        start: number;
+        end: number;
+        content: string;
+      };
+    };
+  };
   conclusion: string;
-  results: any[];
+  answer: string;
+  paths: string[];
+  response_timestamp: string;
+  focused_chunk: {
+    repo_path: { repo: string; path: string };
+    start_line: number;
+    end_line: number;
+  } | null;
+};
+
+export type CodeStudioMessageType =
+  | {
+      User: string;
+    }
+  | { Assistant: string };
+
+export type CodeStudioTokenCountType = {
+  total: number;
+  per_file: (number | null)[];
+  per_doc_file: (number | null)[];
+  messages: number;
+};
+
+export type CodeStudioType = {
+  id: string;
+  name: string;
+  modified_at: string;
+  messages: CodeStudioMessageType[];
+  context: StudioContextFile[];
+  doc_context: StudioContextDoc[];
+  token_counts: CodeStudioTokenCountType;
 };
 
 export interface SuggestionsResponse {
@@ -229,3 +351,68 @@ export interface NLSearchResponse {
   snippets: NLSnippet[];
   user_id: string;
 }
+
+export type StudioTemplateType = {
+  id: string;
+  name: string;
+  content: string;
+  modified_at: string;
+  is_default: boolean;
+};
+
+export type HistoryConversationTurn = Omit<CodeStudioType, 'name'> & {
+  id: number;
+  modified_at: string;
+};
+
+export type TutorialQuestionType = {
+  tag: string;
+  question: string;
+};
+
+export type DocShortType = {
+  id: string;
+  name: string;
+  url: string;
+  favicon: string;
+  index_status: string;
+};
+
+export type DocPageType = {
+  doc_id: string;
+  doc_source: string;
+  relative_url: string;
+  absolute_url: string;
+  doc_title: string;
+};
+
+export type DocSectionType = {
+  ancestry: string[];
+  doc_id: string;
+  doc_source: string;
+  doc_title: string;
+  header: string;
+  point_id: string;
+  relative_url: string;
+  absolute_url: string;
+  section_range: { start: number; end: number };
+  text: string;
+};
+
+export type GeneratedCodeDiff = {
+  chunks: DiffChunkType[];
+};
+
+export type ProjectShortType = {
+  id: string;
+  name: string;
+  modified_at: null | string;
+  most_common_langs: string[];
+};
+
+export type ProjectFullType = ProjectShortType & {
+  repos: { repo: RepoType; branch: string }[];
+  studios: CodeStudioType[];
+  conversations: ConversationShortType[];
+  docs: DocShortType[];
+};

@@ -68,7 +68,10 @@ const TextSearch = ({
         setCurrentHighlightParent(null);
         return;
       }
-      const regex = new RegExp(searchTerm, 'gi');
+      const regex = new RegExp(
+        searchTerm.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'),
+        'gi',
+      );
       if (contentRoot) {
         markNode(contentRoot, regex);
         const allHighlights =
@@ -76,8 +79,9 @@ const TextSearch = ({
         const resNum = allHighlights.length;
         setResultNum(resNum);
         let prevIndexInNewHighlights = currentHighlightParent
-          ? [...allHighlights].findIndex((el) =>
-              el.parentNode?.parentNode?.isSameNode(currentHighlightParent),
+          ? [...allHighlights].findIndex(
+              (el) =>
+                el.parentNode?.parentNode?.isSameNode(currentHighlightParent),
             )
           : -1;
         setCurrentResult((prev) => {
@@ -102,7 +106,9 @@ const TextSearch = ({
   const handleChange = useCallback(
     (searchTerm: string) => {
       setSearchValue(searchTerm);
-      doSearch(searchTerm);
+      if (searchTerm.length > 1) {
+        doSearch(searchTerm);
+      }
     },
     [doSearch],
   );
@@ -136,7 +142,7 @@ const TextSearch = ({
       currentResult={currentResult}
       setCurrentResult={setCurrentResult}
       searchValue={searchValue}
-      containerClassName="fixed top-[66px] right-[5px]"
+      containerClassName="fixed top-[100px] right-[5px] w-80"
     />
   );
 };

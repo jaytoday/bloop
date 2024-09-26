@@ -1,13 +1,12 @@
 import {
   CodeItem,
-  DirectoryEntry,
-  DirectoryItem,
+  File,
   FileItem,
   FileResItem,
   RangeLine,
+  RefDefDataItem,
   RepoItem,
   SuggestionsResponse,
-  TokenInfoItem,
   TokenInfoResponse,
 } from '../types/api';
 import {
@@ -17,11 +16,7 @@ import {
   RepoResult,
   ResultItemType,
   ResultType,
-  TokenInfo,
-  TokenInfoFile,
 } from '../types/results';
-import { FileTreeFileType } from '../types';
-import { sortFiles } from '../utils/file';
 
 const mapRepoResults = (item: RepoItem, id: number): RepoResult => {
   return {
@@ -29,17 +24,15 @@ const mapRepoResults = (item: RepoItem, id: number): RepoResult => {
     id,
     branches: 0,
     files: 0,
-    repository: item.data.name.text,
     highlights: item.data.name.highlights,
     repoName: item.data.name.text,
+    repoRef: item.data.repo_ref,
   };
 };
 
 const mapCodeResults = (item: CodeItem, id: number): CodeResult => {
   return {
     type: ResultItemType.CODE,
-    branch: '',
-    code: '',
     snippets: item.data.snippets.map((snippet) => ({
       code: snippet.data,
       lineStart: snippet.line_range.start,
@@ -54,7 +47,7 @@ const mapCodeResults = (item: CodeItem, id: number): CodeResult => {
     })),
     language: item.data.lang,
     relativePath: item.data.relative_path,
-    repoPath: item.data.repo_ref.replace('local/', ''),
+    repoRef: item.data.repo_ref,
     id,
     repoName: item.data.repo_name,
   };
@@ -65,7 +58,7 @@ const mapFileResults = (item: FileResItem, id: number): FileResult => {
     relativePath: item.data.relative_path.text,
     type: ResultItemType.FILE,
     lines: 0,
-    repoPath: item.data.repo_ref.replace('local/', ''),
+    repoRef: item.data.repo_ref,
     id,
     language: item.data.lang,
     highlights: item.data.relative_path.highlights,
@@ -112,78 +105,59 @@ export const mapRanges = (
   return res;
 };
 
-export const mapDirResult = (directoryItem: DirectoryItem) => {
-  return {
-    name: directoryItem.data.repo_name,
-    entries: mapFileTree(
-      directoryItem.data.entries,
-      directoryItem.data.relative_path,
-    ),
-    relativePath: directoryItem.data.relative_path,
-    repoRef: directoryItem.data.repo_ref,
+export const mapTokenInfo = (
+  tokenInfo: TokenInfoResponse['data'],
+  path: string,
+) => {
+  const map: {
+    references: Record<string, any>;
+    definitions: Record<string, any>;
+  } = {
+    references: [],
+    definitions: [],
   };
-};
-
-const mapFileTree = (siblings: DirectoryEntry[], relativePath: string) => {
-  return siblings
-    .map((item) => ({
-      type:
-        item.entry_data === 'Directory'
-          ? FileTreeFileType.DIR
-          : FileTreeFileType.FILE,
-      path: `${relativePath}${item.name}`,
-      name:
-        item.entry_data === 'Directory'
-          ? item.name.substring(item.name.length - 1, -1)
-          : item.name,
-      lang:
-        item.entry_data !== 'Directory' ? item.entry_data.File.lang : undefined,
-      children: [],
-      selected: item.currentFile,
-    }))
-    .sort(sortFiles);
-};
-
-export const mapFileResult = (fileItem: FileItem) => {
-  return {
-    language: fileItem.data.lang,
-    repoPath: fileItem.data.repo_ref,
-    relativePath: fileItem.data.relative_path,
-    code: fileItem.data.contents,
-    hoverableRanges: [],
-    repoName: fileItem.data.repo_name,
-    fileTree: mapFileTree(
-      fileItem.data.siblings || [],
-      fileItem.data.relative_path,
-    ),
-  };
-};
-
-const mapTokenInfo = (tokenInfoItem: TokenInfoItem[]): TokenInfoFile[] => {
-  return tokenInfoItem?.map((definition) => {
+  const mapItem = (td: RefDefDataItem) => {
+    const trimmed = td.snippet.data.trimStart();
+    const lengthDiff = td.snippet.data.length - trimmed.length;
     return {
-      path: definition.file,
-      items: definition.data.map((item) => {
-        const trimmedLen =
-          item.snippet.data.length - item.snippet.data.trimStart().length;
-        return {
-          code: item.snippet.data.replace('\n', '').trim(),
-          line: item.start.line,
-          highlights: item.snippet.highlights.map((r) => ({
-            start: r.start - trimmedLen,
-            end: r.end - trimmedLen,
-          })),
-        };
-      }),
+      ...td,
+      snippet: {
+        ...td.snippet,
+        data: trimmed,
+        highlights: td.snippet.highlights.map((h) => {
+          return { start: h.start - lengthDiff, end: h.end - lengthDiff };
+        }),
+        tokenRange: td.snippet.highlights[0],
+      },
     };
+  };
+  tokenInfo.forEach((t) => {
+    const references = t.data.filter((d) => d.kind === 'reference');
+    if (references.length) {
+      map.references[t.file] = [
+        ...(map.references[t.file] || []),
+        ...references.map(mapItem),
+      ];
+    }
+    const definitions = t.data.filter((d) => d.kind === 'definition');
+    if (definitions.length) {
+      map.definitions[t.file] = [
+        ...(map.definitions[t.file] || []),
+        ...definitions.map(mapItem),
+      ];
+    }
   });
-};
 
-export const mapTokenInfoData = (tokenInfo: TokenInfoResponse): TokenInfo => {
+  const arrayFromObject = (obj: Record<string, any>) =>
+    Object.entries(obj)
+      .map(([file, data]) => ({
+        file,
+        data,
+      }))
+      .sort((a, b) => (a.file === path ? -1 : b.file === path ? 1 : 0));
+
   return {
-    definitions: tokenInfo.definitions
-      ? mapTokenInfo(tokenInfo.definitions)
-      : [],
-    references: tokenInfo.references ? mapTokenInfo(tokenInfo.references) : [],
+    references: arrayFromObject(map.references),
+    definitions: arrayFromObject(map.definitions),
   };
 };

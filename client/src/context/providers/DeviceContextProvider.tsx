@@ -1,37 +1,33 @@
-import { PropsWithChildren, useEffect } from 'react';
+import { memo, PropsWithChildren, useEffect } from 'react';
 import * as Sentry from '@sentry/react';
 import { DeviceContext, DeviceContextType } from '../deviceContext';
 import { initializeSentry } from '../../utils/services';
+import { EnvConfig } from '../../types/general';
 
 type Props = {
   deviceContextValue: DeviceContextType;
+  envConfig: EnvConfig;
 };
 
-export const DeviceContextProvider = ({
-  children,
-  deviceContextValue,
-}: PropsWithChildren<Props>) => {
-  useEffect(() => {
-    deviceContextValue.invokeTauriCommand('enable_telemetry');
-    if (deviceContextValue.envConfig.sentry_dsn_fe) {
-      initializeSentry(
-        deviceContextValue.envConfig,
-        deviceContextValue.release,
-      );
-    } else {
-      const client = Sentry.getCurrentHub().getClient();
-      if (client) {
-        client.close();
+export const DeviceContextProvider = memo(
+  ({ children, deviceContextValue, envConfig }: PropsWithChildren<Props>) => {
+    useEffect(() => {
+      if (envConfig.sentry_dsn_fe) {
+        initializeSentry(envConfig, deviceContextValue.release);
+      } else {
+        const client = Sentry.getCurrentHub().getClient();
+        if (client) {
+          client.close();
+        }
       }
-    }
-  }, [
-    deviceContextValue.invokeTauriCommand,
-    deviceContextValue.envConfig.sentry_dsn_fe,
-  ]);
+    }, [envConfig.sentry_dsn_fe]);
 
-  return (
-    <DeviceContext.Provider value={deviceContextValue}>
-      {children}
-    </DeviceContext.Provider>
-  );
-};
+    return (
+      <DeviceContext.Provider value={deviceContextValue}>
+        {children}
+      </DeviceContext.Provider>
+    );
+  },
+);
+
+DeviceContextProvider.displayName = 'DeviceContextProvider';

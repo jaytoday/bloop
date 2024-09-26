@@ -19,6 +19,8 @@ use crate::query::{
     planner,
 };
 
+const MAX_CASE_PERMUTATION_LEN: usize = 5;
+
 type DynQuery = Box<dyn tantivy::query::Query>;
 
 enum Extraction<'a> {
@@ -94,24 +96,32 @@ impl Compiler {
 
             for (field, extractor) in &mut self.extractors {
                 let Some(extraction) = extractor(query) else {
-                    continue
+                    continue;
                 };
 
                 let field_query = match extraction {
                     Extraction::Literal(Literal::Plain(text)) => {
-                        let tokenizer = index
+                        let mut tokenizer = index
                             .tokenizer_for_field(*field)
                             .context("field is missing tokenizer")?;
 
                         let mut token_stream = tokenizer.token_stream(&text);
                         let tokens = std::iter::from_fn(move || {
                             token_stream.next().map(|tok| CompactString::new(&tok.text))
-                        });
+                        })
+                        .collect::<Vec<_>>();
 
-                        let terms = if query.is_case_sensitive() {
-                            tokens.map(|s| str_to_query(*field, &s)).collect::<Vec<_>>()
+                        // We skip case insensitive matching if a token
+                        let terms = if query.is_case_sensitive()
+                            || tokens.iter().any(|t| t.len() > MAX_CASE_PERMUTATION_LEN)
+                        {
+                            tokens
+                                .into_iter()
+                                .map(|s| str_to_query(*field, &s))
+                                .collect::<Vec<_>>()
                         } else {
                             tokens
+                                .into_iter()
                                 .map(|s| {
                                     let terms = case_permutations(&s)
                                         .map(|s| str_to_query(*field, &s))
@@ -209,7 +219,7 @@ pub fn trigrams(s: &str) -> impl Iterator<Item = CompactString> {
 
     std::iter::from_fn(move || match chars.len() {
         0 => None,
-        1 | 2 | 3 => Some(mem::take(&mut chars).into_iter().collect()),
+        1..=3 => Some(mem::take(&mut chars).into_iter().collect()),
         _ => {
             let out = chars.iter().take(3).collect();
             chars.remove(0);
@@ -253,9 +263,8 @@ pub fn case_permutations(s: &str) -> impl Iterator<Item = CompactString> {
         .map(|c| c.to_ascii_lowercase())
         .collect::<SmallVec<[char; 3]>>();
 
-    // Make sure not to overflow. The end condition is a mask with the highest bit set, and we use
-    // `u32` masks.
-    debug_assert!(chars.len() <= 31);
+    // A string that is too long leads to an exponential explosion here, growing with 2^n.
+    debug_assert!(chars.len() <= MAX_CASE_PERMUTATION_LEN);
 
     let num_chars = chars.len();
 
@@ -376,7 +385,7 @@ mod tests {
             let (occur, term) = &subquery.clauses()[0];
             let term = term.downcast_ref::<TermQuery>().unwrap();
             assert_eq!(*occur, Occur::Should);
-            assert_eq!(term.term().as_str().unwrap(), expected);
+            assert_eq!(term.term().value().as_str().unwrap(), expected);
         }
     }
 }

@@ -1,109 +1,14 @@
 import IconWrapper from './Wrapper';
 
 const RawIcon = (
-  <svg viewBox="0 0 16 18" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect
-      x="3.75"
-      y="5"
-      width="8.5"
-      height="11.5"
-      rx="4.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-    />
-    <rect
-      x="5.25"
-      y="1.5"
-      width="5.5"
-      height="2.5"
-      rx="1.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-    />
+  <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path
-      d="M8 5.25V16.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M3.5 7.25L2.25722 6.75289C1.4979 6.44916 1 5.71374 1 4.89593V3.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M3.5 12.25L2.25722 12.7471C1.4979 13.0508 1 13.7863 1 14.6041V16.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M12.5 7.25L13.7428 6.75289C14.5021 6.44916 15 5.71374 15 4.89593V3.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M12.5 12.25L13.7428 12.7471C14.5021 13.0508 15 13.7863 15 14.6041V16.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M11.3333 4.66683H11.9999C12.2739 4.66683 12.5092 4.83206 12.6118 5.0683L13.6054 4.70697C13.9514 4.58114 14.334 4.75965 14.4598 5.10567C14.5856 5.45169 14.4071 5.8342 14.0611 5.96003L12.6666 6.46711V8.00016H13.9999C14.3681 8.00016 14.6666 8.29864 14.6666 8.66683C14.6666 9.03502 14.3681 9.3335 13.9999 9.3335H12.6666V10.0002C12.6666 10.2866 12.6408 10.567 12.5914 10.8392L14.0611 11.3736C14.4071 11.4995 14.5856 11.882 14.4598 12.228C14.334 12.574 13.9514 12.7525 13.6054 12.6267L12.1668 12.1036C11.4933 13.4352 10.2002 14.4002 8.66659 14.6196V8.66683C8.66659 8.29864 8.36811 8.00016 7.99992 8.00016C7.63173 8.00016 7.33325 8.29864 7.33325 8.66683V14.6196C5.79964 14.4002 4.50656 13.4352 3.83304 12.1036L2.39441 12.6267C2.04839 12.7525 1.66588 12.574 1.54006 12.228C1.41423 11.882 1.59273 11.4995 1.93876 11.3736L3.40847 10.8392C3.35906 10.567 3.33325 10.2866 3.33325 10.0002V9.3335H1.99992C1.63173 9.3335 1.33325 9.03502 1.33325 8.66683C1.33325 8.29864 1.63173 8.00016 1.99992 8.00016H3.33325V6.46711L1.93876 5.96003C1.59273 5.8342 1.41423 5.45169 1.54006 5.10567C1.66588 4.75965 2.04839 4.58114 2.39441 4.70697L3.38808 5.0683C3.49062 4.83206 3.72597 4.66683 3.99992 4.66683H4.66659C4.66659 2.82588 6.15897 1.3335 7.99992 1.3335C9.84087 1.3335 11.3333 2.82588 11.3333 4.66683ZM7.99992 2.66683C6.89535 2.66683 5.99992 3.56226 5.99992 4.66683H9.99992C9.99992 3.56226 9.10449 2.66683 7.99992 2.66683Z"
+      fill="currentColor"
     />
   </svg>
 );
 
-const BoxedIcon = (
-  <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect
-      x="5.75"
-      y="6"
-      width="8.5"
-      height="11.5"
-      rx="4.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-    />
-    <rect
-      x="7.25"
-      y="2.5"
-      width="5.5"
-      height="2.5"
-      rx="1.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-    />
-    <path
-      d="M10 6.25V17.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M5.5 8.25L4.25722 7.75289C3.4979 7.44916 3 6.71374 3 5.89593V4.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M5.5 13.25L4.25722 13.7471C3.4979 14.0508 3 14.7863 3 15.6041V17.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M14.5 8.25L15.7428 7.75289C16.5021 7.44916 17 6.71374 17 5.89593V4.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-    <path
-      d="M14.5 13.25L15.7428 13.7471C16.5021 14.0508 17 14.7863 17 15.6041V17.25"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-    />
-  </svg>
-);
-
-export default IconWrapper(RawIcon, BoxedIcon);
+export default IconWrapper(RawIcon);

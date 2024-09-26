@@ -1,150 +1,74 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { DeviceContextType } from './context/deviceContext';
-import './index.css';
-import 'highlight.js/styles/vs2015.css';
-import Tab from './Tab';
-import { TabsContext } from './context/tabsContext';
-import { RepoType, UITabType } from './types/general';
-import {
-  getJsonFromStorage,
-  getPlainFromStorage,
-  LAST_ACTIVE_TAB_KEY,
-  saveJsonToStorage,
-  savePlainToStorage,
-  TABS_KEY,
-} from './services/storage';
-import { getRepos, initApi } from './services/api';
-import { useComponentWillMount } from './hooks/useComponentWillMount';
-import { RepoSource } from './types';
-import { RepositoriesContext } from './context/repositoriesContext';
+import React, { memo } from 'react';
+import { DndProvider } from 'react-dnd';
+import * as Sentry from '@sentry/react';
+import { HTML5Backend } from 'react-dnd-html5-backend';
+import { Toaster } from 'sonner';
 import { AnalyticsContextProvider } from './context/providers/AnalyticsContextProvider';
+import { PersonalQuotaContextProvider } from './context/providers/PersonalQuotaContextProvider';
+import ReportBugModal from './components/ReportBugModal';
+import Onboarding from './Onboarding';
+import Project from './Project';
+import CommandBar from './CommandBar';
+import ProjectContextProvider from './context/providers/ProjectContextProvider';
+import CommandBarContextProvider from './context/providers/CommandBarContextProvider';
+import { UIContextProvider } from './context/providers/UIContextProvider';
+import Settings from './Settings';
+import ProjectSettings from './ProjectSettings';
+import TabsContextProvider from './context/providers/TabsContextProvider';
+import { FileHighlightsContextProvider } from './context/providers/FileHighlightsContextProvider';
+import RepositoriesContextProvider from './context/providers/RepositoriesContextProvider';
+import UpgradeRequiredPopup from './components/UpgradeRequiredPopup';
+import ErrorFallback from './components/ErrorFallback';
 
-type Props = {
-  deviceContextValue: DeviceContextType;
+const toastOptions = {
+  unStyled: true,
+  classNames: {
+    toast:
+      'w-[20.75rem] p-4 pl-5 grid grid-cols-[1rem_1fr] items-start gap-3 rounded-md border border-bg-border bg-bg-base shadow-high',
+    error: 'text-red',
+    info: 'text-label-title',
+    title: 'body-s-b',
+    description: '!text-label-muted body-s mt-1.5',
+    actionButton: 'col-span-full',
+    cancelButton: 'bg-orange-400',
+    closeButton:
+      '!bg-bg-base !text-label-muted !border-none !left-[unset] !right-2 !top-6 !w-6 !h-6',
+  },
 };
 
-function App({ deviceContextValue }: Props) {
-  useComponentWillMount(() => initApi(deviceContextValue.apiUrl));
-
-  const [tabs, setTabs] = useState<UITabType[]>([
-    {
-      key: 'initial',
-      name: 'Home',
-      repoName: '',
-      source: RepoSource.LOCAL,
-    },
-  ]);
-  const [activeTab, setActiveTab] = useState('initial');
-  const [repositories, setRepositories] = useState<RepoType[] | undefined>();
-
-  const handleAddTab = useCallback(
-    (repoRef: string, repoName: string, name: string, source: RepoSource) => {
-      const newTab = {
-        key: repoRef,
-        name,
-        repoName,
-        source,
-      };
-      setTabs((prev) => {
-        const existing = prev.find((t) => t.key === newTab.key);
-        if (existing) {
-          setActiveTab(existing.key);
-          return prev;
-        }
-        return [...prev, newTab];
-      });
-      setActiveTab(newTab.key);
-    },
-    [],
-  );
-
-  useEffect(() => {
-    saveJsonToStorage(TABS_KEY, tabs);
-  }, [tabs]);
-
-  useEffect(() => {
-    savePlainToStorage(LAST_ACTIVE_TAB_KEY, activeTab);
-  }, [activeTab]);
-
-  useEffect(() => {
-    if (!tabs.find((t) => t.key === activeTab)) {
-      setActiveTab('initial');
-    }
-  }, [activeTab, tabs]);
-
-  const handleRemoveTab = useCallback(
-    (tabKey: string) => {
-      setActiveTab((prev) => {
-        const prevIndex = tabs.findIndex((t) => t.key === prev);
-        if (tabKey === prev) {
-          return prevIndex > 0
-            ? tabs[prevIndex - 1].key
-            : tabs[prevIndex + 1].key;
-        }
-        return prev;
-      });
-      setTabs((prev) => prev.filter((t) => t.key !== tabKey));
-    },
-    [tabs],
-  );
-
-  const contextValue = useMemo(
-    () => ({
-      tabs,
-      activeTab,
-      handleAddTab,
-      handleRemoveTab,
-      setActiveTab,
-    }),
-    [tabs, activeTab, handleAddTab, handleRemoveTab],
-  );
-
-  const fetchRepos = useCallback(() => {
-    getRepos().then((data) => {
-      const list = data?.list?.sort((a, b) => (a.name < b.name ? -1 : 1)) || [];
-      setRepositories(list);
-    });
-  }, []);
-
-  useEffect(() => {
-    fetchRepos();
-    const intervalId = setInterval(fetchRepos, 5000);
-    return () => {
-      clearInterval(intervalId);
-    };
-  }, []);
-
-  const reposContextValue = useMemo(
-    () => ({
-      repositories,
-      setRepositories,
-      localSyncError: false,
-      githubSyncError: false,
-      fetchRepos,
-    }),
-    [repositories],
-  );
-
+const App = () => {
   return (
-    <AnalyticsContextProvider
-      forceAnalytics={deviceContextValue.forceAnalytics}
-      isSelfServe={deviceContextValue.isSelfServe}
-      envConfig={deviceContextValue.envConfig}
-    >
-      <RepositoriesContext.Provider value={reposContextValue}>
-        <TabsContext.Provider value={contextValue}>
-          {tabs.map((t) => (
-            <Tab
-              key={t.key}
-              deviceContextValue={deviceContextValue}
-              isActive={t.key === activeTab}
-              tab={t}
-            />
-          ))}
-        </TabsContext.Provider>
-      </RepositoriesContext.Provider>
-    </AnalyticsContextProvider>
+    <DndProvider backend={HTML5Backend}>
+      <AnalyticsContextProvider>
+        <PersonalQuotaContextProvider>
+          <UIContextProvider>
+            <ProjectContextProvider>
+              <Toaster closeButton toastOptions={toastOptions} />
+              <RepositoriesContextProvider>
+                <ReportBugModal />
+                <Onboarding />
+                <UpgradeRequiredPopup />
+                <CommandBarContextProvider>
+                  <Settings />
+                  <ProjectSettings />
+                  <FileHighlightsContextProvider>
+                    <TabsContextProvider>
+                      <CommandBar />
+                      <Project />
+                    </TabsContextProvider>
+                  </FileHighlightsContextProvider>
+                </CommandBarContextProvider>
+              </RepositoriesContextProvider>
+            </ProjectContextProvider>
+          </UIContextProvider>
+        </PersonalQuotaContextProvider>
+      </AnalyticsContextProvider>
+    </DndProvider>
   );
-}
+};
 
-export default App;
+export default memo(
+  Sentry.withErrorBoundary(App, {
+    fallback: (props) => <ErrorFallback {...props} />,
+  }),
+);

@@ -1,24 +1,35 @@
-import { MouseEvent, ReactElement } from 'react';
+import { memo, MouseEvent, ReactElement, useCallback } from 'react';
 import { Range } from '../../types/results';
+
+type HighlightedString = {
+  label: string;
+  highlight?: Range;
+};
+
+type ItemElement = {
+  label: ReactElement<any, any>;
+  highlight?: never;
+};
 
 type Props = {
   icon?: ReactElement<any, any>;
-  label: string;
   onClick?: (e: MouseEvent<HTMLButtonElement>) => void;
   isLast?: boolean;
   limitSectionWidth?: boolean;
-  highlight?: Range;
+  nonInteractive?: boolean;
   type: 'link' | 'button';
-};
+} & (HighlightedString | ItemElement);
 
 const typeMap = {
   link: {
     default: 'text-label-base hover:text-bg-main active:text-bg-main',
+    nonInteractive: 'text-label-base',
     isLast: 'text-label-title',
   },
   button: {
     default:
       'px-2 py-1 rounded-4 hover:bg-bg-base-hover text-label-base hover:text-label-title',
+    nonInteractive: 'px-2 py-1 rounded-4 text-label-base',
     isLast: 'text-label-base px-2 py-1 rounded-4',
   },
 };
@@ -31,8 +42,9 @@ const BreadcrumbSection = ({
   highlight,
   type,
   limitSectionWidth,
+  nonInteractive,
 }: Props) => {
-  const getHighlight = () => {
+  const getHighlight = useCallback(() => {
     if (highlight) {
       const left = label.substring(0, highlight.start);
       const search = label.substring(highlight.start, highlight.end + 1);
@@ -48,11 +60,17 @@ const BreadcrumbSection = ({
       );
     }
     return label;
-  };
+  }, [highlight, label]);
   return (
     <button
-      className={`flex items-center gap-1 cursor-pointer ${
-        isLast ? typeMap[type].isLast : typeMap[type].default
+      className={`flex items-center gap-1 ${
+        nonInteractive ? '' : 'cursor-pointer'
+      } ${
+        nonInteractive
+          ? typeMap[type].nonInteractive
+          : isLast
+          ? typeMap[type].isLast
+          : typeMap[type].default
       } ${
         limitSectionWidth ? 'max-w-[8rem] ellipsis' : ''
       } transition-all duration-300 ease-in-bounce flex-shrink-0`}
@@ -68,4 +86,4 @@ const BreadcrumbSection = ({
   );
 };
 
-export default BreadcrumbSection;
+export default memo(BreadcrumbSection);

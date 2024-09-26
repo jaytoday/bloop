@@ -5,6 +5,7 @@ use crate::{
         execute::{ApiQuery, PagingMetadata, QueryResponse, QueryResult, ResultStats},
         parser::SemanticQuery,
     },
+    semantic::SemanticSearchParams,
     snippet::Snippet,
 };
 
@@ -20,22 +21,25 @@ pub async fn execute(
     let results = semantic
         .search(
             &query,
-            params.page_size as u64,
-            ((params.page + 1) * params.page_size) as u64,
-            false,
+            SemanticSearchParams {
+                limit: params.page_size as u64,
+                offset: ((params.page + 1) * params.page_size) as u64,
+                threshold: 0.0,
+                exact_match: false,
+            },
         )
         .await?;
 
     let data = results
         .into_iter()
-        .fold(HashMap::new(), |mut acc, payload| {
+        .fold(HashMap::<_, Vec<_>>::new(), |mut acc, payload| {
             acc.entry((
                 payload.relative_path.to_string(),
                 payload.repo_name.to_string(),
                 payload.repo_ref.to_string(),
                 Some(payload.lang.to_string()),
             ))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Snippet {
                 data: payload.text.to_string(),
                 line_range: payload.start_line as usize..payload.end_line as usize,

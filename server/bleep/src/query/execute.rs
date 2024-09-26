@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::MAIN_SEPARATOR,
     sync::Arc,
 };
 
@@ -11,7 +10,9 @@ use crate::{
         reader::{base_name, ContentReader, FileReader, OpenReader, RepoReader},
         DocumentRead, File, Indexable, Indexer, Indexes, Repo,
     },
+    repo::RepoRef,
     snippet::{HighlightedString, SnippedFile, Snipper},
+    Application,
 };
 
 use anyhow::{bail, Result};
@@ -45,6 +46,15 @@ pub struct ApiQuery {
     /// A query written in the bloop query language
     pub q: String,
 
+    /// Project ID.
+    // NB: We implement methods directly on this struct, which need access to the project ID
+    // associated with this request. This doesn't fit our API; we obtain the project ID via the
+    // router and not via URL query parameters. The abstraction here likely needs to be reworked a
+    // bit, as this can be improved. For now, we just add a skipped field, and manually set it
+    // after deserialization. TODO: Fix this.
+    #[serde(skip)]
+    pub project_id: i64,
+
     #[serde(default)]
     pub page: usize,
 
@@ -64,11 +74,11 @@ pub struct ApiQuery {
 
     /// The number of lines of context in the snippet before the search result
     #[serde(alias = "cb", default = "default_context")]
-    context_before: usize,
+    pub context_before: usize,
 
     /// The number of lines of context in the snippet after the search result
     #[serde(alias = "ca", default = "default_context")]
-    context_after: usize,
+    pub context_after: usize,
 }
 
 #[derive(Serialize)]
@@ -146,8 +156,33 @@ pub struct RepositoryResultData {
 pub struct FileResultData {
     repo_name: String,
     relative_path: HighlightedString,
-    repo_ref: String,
+    repo_ref: RepoRef,
     lang: Option<String>,
+    branches: String,
+    indexed: bool,
+    is_dir: bool,
+}
+
+impl FileResultData {
+    pub fn new(
+        repo_name: String,
+        relative_path: String,
+        repo_ref: RepoRef,
+        lang: Option<String>,
+        branches: String,
+        indexed: bool,
+        is_dir: bool,
+    ) -> Self {
+        Self {
+            repo_name,
+            relative_path: HighlightedString::new(relative_path),
+            repo_ref,
+            lang,
+            branches,
+            indexed,
+            is_dir,
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -158,6 +193,10 @@ pub struct FileData {
     lang: Option<String>,
     contents: String,
     siblings: Vec<DirEntry>,
+    indexed: bool,
+    size: usize,
+    loc: usize,
+    sloc: usize,
 }
 
 #[derive(Serialize)]
@@ -177,7 +216,7 @@ pub struct DirEntry {
 #[derive(Serialize, PartialEq, Eq, Hash, Clone, Debug)]
 enum EntryData {
     Directory,
-    File { lang: Option<String> },
+    File { lang: Option<String>, indexed: bool },
 }
 
 #[async_trait]
@@ -193,11 +232,113 @@ pub trait ExecuteQuery {
 }
 
 impl ApiQuery {
-    pub async fn query(self: Arc<Self>, indexes: Arc<Indexes>) -> Result<QueryResponse> {
-        let query = self.q.clone();
-        let compiled = parser::parse(&query)?;
-        tracing::debug!("compiled query as {compiled:?}");
-        self.query_with(indexes, compiled).await
+    pub async fn query(self: Arc<Self>, app: &Application) -> Result<QueryResponse> {
+        let raw_query = self.q.clone();
+        let queries = self
+            .restrict_queries(parser::parse(&raw_query)?, app)
+            .await?;
+        tracing::debug!("compiled query as {queries:?}");
+        self.query_with(Arc::clone(&app.indexes), queries).await
+    }
+
+    /// This restricts a set of input parser queries.
+    ///
+    /// We trim down the input by:
+    ///
+    /// 1. Discarding all queries that reference repos not in the queried project
+    /// 2. Regenerating more specific queries for those without repo restrictions, such that there
+    ///    is a new query generated per repo that exists in the project.
+    ///
+    /// The idea here is to allow us to restrict the possible input space of queried documents to
+    /// be more specific as required by the project state.
+    ///
+    /// The `subset` flag indicates whether repo name matching is whole-string, or whether the
+    /// string must only be a substring of an existing repo. This is useful in autocomplete
+    /// scenarios, where we want to restrict queries such that they are not fully typed out.
+    pub async fn restrict_queries<'a>(
+        &self,
+        queries: impl IntoIterator<Item = parser::Query<'a>>,
+        app: &Application,
+    ) -> Result<Vec<parser::Query<'a>>> {
+        let repo_branches = sqlx::query! {
+            "SELECT repo_ref, branch
+            FROM project_repos
+            WHERE project_id = ?",
+            self.project_id,
+        }
+        .fetch_all(&*app.sql)
+        .await?
+        .into_iter()
+        .map(|row| {
+            (
+                row.repo_ref.parse::<RepoRef>().unwrap().indexed_name(),
+                row.branch,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+        let mut out = Vec::new();
+
+        for q in queries {
+            if let Some(r) = q.repo_str() {
+                // The branch that this project has loaded this repo with.
+                let project_branch = repo_branches.get(&r).and_then(Option::as_ref);
+
+                // If the branch doesn't match what we expect, drop the query.
+                if q.branch_str().as_ref() == project_branch {
+                    out.push(q);
+                }
+            } else {
+                for (r, b) in &repo_branches {
+                    out.push(parser::Query {
+                        repo: Some(parser::Literal::from(r)),
+                        branch: b.as_ref().map(parser::Literal::from),
+                        ..q.clone()
+                    });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// This restricts a set of input repo-only queries.
+    ///
+    /// This is useful for autocomplete queries, which are effectively just `repo:foo`, where the
+    /// repo name may be partially written.
+    pub async fn restrict_repo_queries<'a>(
+        &self,
+        queries: impl IntoIterator<Item = parser::Query<'a>>,
+        app: &Application,
+    ) -> Result<Vec<parser::Query<'a>>> {
+        let repo_refs = sqlx::query! {
+            "SELECT repo_ref
+            FROM project_repos
+            WHERE project_id = ?",
+            self.project_id,
+        }
+        .fetch_all(&*app.sql)
+        .await?
+        .into_iter()
+        .map(|row| row.repo_ref.parse::<RepoRef>().unwrap().indexed_name())
+        .collect::<Vec<_>>();
+
+        let mut out = Vec::new();
+
+        for q in queries {
+            if let Some(r) = q.repo_str() {
+                for m in repo_refs.iter().filter(|r2| r2.contains(&r)) {
+                    out.push(parser::Query {
+                        repo: Some(parser::Literal::from(m)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        out.dedup();
+
+        Ok(out)
     }
 
     pub async fn query_with(
@@ -470,6 +611,9 @@ impl ExecuteQuery for FileReader {
                     repo_name: f.repo_name,
                     repo_ref: f.repo_ref,
                     lang: f.lang,
+                    branches: f.branches,
+                    indexed: f.indexed,
+                    is_dir: f.is_dir,
                 })
             })
             .collect::<Vec<QueryResult>>();
@@ -507,7 +651,7 @@ impl ExecuteQuery for RepoReader {
             .iter()
             .filter(|q| self.query_matches(q))
             .filter_map(|q| {
-                let regex_str = q.path.as_ref()?.regex_str();
+                let regex_str = q.repo.as_ref()?.regex_str();
                 let case_insensitive = !q.is_case_sensitive();
                 let regex = RegexBuilder::new(&regex_str)
                     .case_insensitive(case_insensitive)
@@ -583,9 +727,9 @@ impl ExecuteQuery for OpenReader {
         _q: &ApiQuery,
     ) -> Result<QueryResponse> {
         #[derive(Debug)]
-        struct Directive<'a> {
-            relative_path: &'a str,
-            repo_name: &'a str,
+        struct Directive {
+            relative_path: String,
+            repo_name: String,
         }
 
         let open_directives = queries
@@ -594,11 +738,11 @@ impl ExecuteQuery for OpenReader {
             .filter_map(|q| {
                 Some(Directive {
                     relative_path: match q.path.as_ref() {
-                        None => "",
-                        Some(parser::Literal::Plain(p)) => p,
+                        None => "".into(),
+                        Some(parser::Literal::Plain(p)) => p.to_string(),
                         Some(parser::Literal::Regex(..)) => return None,
                     },
-                    repo_name: q.repo.as_ref()?.as_plain()?,
+                    repo_name: q.repo.as_ref()?.as_plain()?.into(),
                 })
             })
             .collect::<SmallVec<[_; 2]>>();
@@ -611,6 +755,8 @@ impl ExecuteQuery for OpenReader {
             .map(|d| d.relative_path.to_owned())
             .collect::<Vec<_>>();
 
+        tracing::trace!(?relative_paths, "creating collector");
+
         let collector = BytesFilterCollector::new(
             indexer.source.raw_relative_path,
             move |b| {
@@ -618,18 +764,20 @@ impl ExecuteQuery for OpenReader {
                     return false;
                 };
 
+                tracing::trace!(?relative_path, "filtering relative path");
+
                 // Check if *any* of the relative paths match. We can't compare repositories here
                 // because the `BytesFilterCollector` operates on one field. So we sort through this
                 // later. It's unlikely that a search will use more than one open query.
                 relative_paths.iter().any(|rp| {
-                    let rp = rp.trim_end_matches(|c| c != MAIN_SEPARATOR);
+                    let rp = rp.trim_end_matches(|c| c != '/');
 
                     matches!(
                         // Trim trailing suffix and avoid returning results for an empty string
                         // (this means that the document we are looking at is the folder itself; a
                         // redundant result).
-                        relative_path.strip_prefix(rp).map(|p| p.trim_end_matches(MAIN_SEPARATOR)),
-                        Some(p) if !p.is_empty() && !p.contains(MAIN_SEPARATOR)
+                        relative_path.strip_prefix(rp).map(|p| p.trim_end_matches('/')),
+                        Some(p) if !p.is_empty() && !p.contains('/')
                     )
                 })
             },
@@ -648,8 +796,8 @@ impl ExecuteQuery for OpenReader {
         // Set of (repo_name, relative_path) that should be returned.
         let directories = open_directives
             .iter()
-            .filter(|d| d.relative_path.is_empty() || d.relative_path.ends_with(MAIN_SEPARATOR))
-            .map(|d| (d.repo_name, d.relative_path))
+            .filter(|d| d.relative_path.is_empty() || d.relative_path.ends_with('/'))
+            .map(|d| (&d.repo_name, &d.relative_path))
             .collect::<HashSet<_>>();
 
         // Iterate over each combination of (document, directive).
@@ -669,30 +817,41 @@ impl ExecuteQuery for OpenReader {
                         repo_ref: doc.repo_ref.to_owned(),
                         lang: doc.lang.clone(),
                         contents: doc.content.clone(),
+                        size: doc.content.len(),
+                        loc: doc.line_end_indices.len(),
+                        indexed: doc.indexed,
+                        sloc: doc
+                            .line_end_indices
+                            .iter()
+                            .zip(doc.line_end_indices.iter().skip(1))
+                            .filter(|(&prev, &next)| next - prev != 1)
+                            .count()
+                            .saturating_add(1),
                         siblings: vec![],
                     });
 
                     continue;
                 }
 
-                let relative_path = base_name(directive.relative_path);
+                let relative_path = base_name(&directive.relative_path);
 
                 if let Some(entry) = doc
                     .relative_path
                     .strip_prefix(relative_path)
-                    .and_then(|s| s.split_inclusive(MAIN_SEPARATOR).next())
+                    .and_then(|s| s.split_inclusive('/').next())
                 {
                     dir_entries
-                        .entry((directive.repo_name, relative_path))
+                        .entry((&directive.repo_name, relative_path))
                         .or_insert_with(|| (doc.repo_ref.to_owned(), HashSet::default()))
                         .1
                         .insert(DirEntry {
                             name: entry.to_owned(),
-                            entry_data: if entry.contains(MAIN_SEPARATOR) {
+                            entry_data: if entry.contains('/') {
                                 EntryData::Directory
                             } else {
                                 EntryData::File {
                                     lang: doc.lang.clone(),
+                                    indexed: doc.indexed,
                                 }
                             },
                         });
@@ -762,7 +921,7 @@ mod tests {
                       "end": 56,
                     }],
                     "symbols": [],
-                    "data": r#"        mut writer: IndexWriter,\n        _threads: usize,\n    ) -> Result<()> {"#,
+                    "data": r"        mut writer: IndexWriter,\n        _threads: usize,\n    ) -> Result<()> {",
                     "line_range": {
                       "start": 49,
                       "end": 51
@@ -798,7 +957,7 @@ mod tests {
                 repo_ref: "/User/bloop/bleep".into(),
                 lang: Some("Rust".into()),
                 snippets: vec![Snippet {
-                    data: r#"        mut writer: IndexWriter,\n        _threads: usize,\n    ) -> Result<()> {"#.to_owned(),
+                    data: r"        mut writer: IndexWriter,\n        _threads: usize,\n    ) -> Result<()> {".to_owned(),
                     line_range: 49..51,
                     highlights: vec![51..56],
                     symbols: vec![],

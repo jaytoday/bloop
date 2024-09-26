@@ -9,26 +9,16 @@ use std::{
 };
 use tracing::debug;
 
-use crate::state::{get_relative_path, pretty_write_file};
+use crate::state::get_relative_path;
 
 pub(crate) mod iterator;
 use iterator::language;
 
-pub(crate) type FileCache = Arc<scc::HashMap<PathBuf, FreshValue<String>>>;
+pub use iterator::{BranchFilter, BranchFilterConfig, FileFilter, FileFilterConfig, FilterUpdate};
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct FreshValue<T> {
-    // default value is `false` on deserialize
-    #[serde(skip)]
-    pub(crate) fresh: bool,
-    pub(crate) value: T,
-}
-
-impl<T> From<T> for FreshValue<T> {
-    fn from(value: T) -> Self {
-        Self { fresh: true, value }
-    }
-}
+#[derive(thiserror::Error, Debug)]
+#[error("repository locked")]
+pub struct RepoLocked;
 
 // Types of repo
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug)]
@@ -107,23 +97,14 @@ impl RepoRef {
 
     pub fn indexed_name(&self) -> String {
         // Local repos indexed as: dirname
-        // Github repos indexed as: github.com/org/repo
+        // Github repos indexed as: org/repo
         match self.backend {
             Backend::Local => Path::new(&self.name)
                 .file_name()
                 .expect("last component is `..`")
                 .to_string_lossy()
                 .into(),
-            Backend::Github => format!("{}", self),
-        }
-    }
-
-    pub fn display_name(&self) -> String {
-        match self.backend {
-            // org_name/repo_name
             Backend::Github => self.name.to_owned(),
-            // repo_name
-            Backend::Local => self.indexed_name(),
         }
     }
 
@@ -202,12 +183,48 @@ impl<'de> Deserialize<'de> for RepoRef {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Repository {
+    /// Path to the physical location of the repo root
     pub disk_path: PathBuf,
+
+    /// Configuration of the remote to sync with
     pub remote: RepoRemote,
+
+    /// Current user-readable status of syncing
     pub sync_status: SyncStatus,
-    pub last_commit_unix_secs: u64,
+
+    /// Time of last commit at the last successful index
+    pub last_commit_unix_secs: i64,
+
+    /// Time of last successful index
     pub last_index_unix_secs: u64,
+
+    /// Most common language
     pub most_common_lang: Option<String>,
+
+    /// Filters which branches to index
+    pub branch_filter: Option<BranchFilterConfig>,
+
+    /// Custom file filter overrides
+    #[serde(default)]
+    pub file_filter: FileFilterConfig,
+
+    /// Indicate that this repository is to be cloned as a shallow copy
+    ///
+    /// Defaults to `false for existing repos.
+    ///
+    /// This is a set-once value, meaning there's no meaningful
+    /// reversal of a `false` value to `true`, but `true` to `false`
+    /// is ok.
+    #[serde(default)]
+    pub shallow: bool,
+
+    /// Sync lock
+    #[serde(skip)]
+    pub locked: bool,
+
+    /// Current user-readable status of syncing
+    #[serde(skip)]
+    pub pub_sync_status: SyncStatus,
 }
 
 impl Repository {
@@ -240,35 +257,50 @@ impl Repository {
 
         Self {
             sync_status: SyncStatus::Queued,
+            pub_sync_status: SyncStatus::Queued,
             last_index_unix_secs: 0,
             last_commit_unix_secs: 0,
+            most_common_lang: None,
+            branch_filter: None,
+            file_filter: Default::default(),
+            locked: false,
+            shallow: false,
             disk_path,
             remote,
-            most_common_lang: None,
+        }
+    }
+
+    /// Delete the on-disk data for this repository asynchronously.
+    pub async fn remove_all(&self) -> Result<(), std::io::Error> {
+        if self.disk_path.exists() {
+            tokio::fs::remove_dir_all(&self.disk_path).await
+        } else {
+            Ok(())
         }
     }
 
     /// Pre-scan the repository to provide supporting metadata for a
     /// new indexing operation
-    pub async fn get_repo_metadata(&self) -> Result<Arc<RepoMetadata>, RepoError> {
+    pub async fn get_repo_metadata(&self) -> Arc<RepoMetadata> {
         let last_commit_unix_secs = gix::open(&self.disk_path)
             .context("failed to open git repo")
-            .and_then(|repo| Ok(repo.head()?.peel_to_commit_in_place()?.time()?.seconds()))
-            .unwrap_or(0) as u64;
+            .and_then(|repo| Ok(repo.head()?.peel_to_commit_in_place()?.time()?.seconds))
+            .ok();
 
         let langs = Default::default();
 
-        Ok(RepoMetadata {
+        RepoMetadata {
             last_commit_unix_secs,
             langs,
         }
-        .into())
+        .into()
     }
 
     /// Marks the repository for removal on the next sync
     /// Does not initiate a new sync.
     pub(crate) fn mark_removed(&mut self) {
         self.sync_status = SyncStatus::Removed;
+        self.pub_sync_status = SyncStatus::Removed;
     }
 
     /// Marks the repository for indexing on the next sync
@@ -277,44 +309,45 @@ impl Repository {
         self.sync_status = SyncStatus::Queued;
     }
 
-    pub(crate) fn sync_done_with(&mut self, metadata: Arc<RepoMetadata>) {
+    /// Locks the repository or returns with an error if already locked.
+    ///
+    /// The returned error helps track conflicting sync processes, and
+    /// avoids ambiguity about the lifecycle the repository's in.
+    pub(crate) fn lock(&mut self) -> Result<(), RepoLocked> {
+        if self.locked {
+            Err(RepoLocked)
+        } else {
+            self.locked = true;
+            Ok(())
+        }
+    }
+
+    pub(crate) fn sync_done_with(
+        &mut self,
+        shallow: bool,
+        filter_update: &FilterUpdate,
+        metadata: Arc<RepoMetadata>,
+    ) {
         self.last_index_unix_secs = get_unix_time(SystemTime::now());
-        self.last_commit_unix_secs = metadata.last_commit_unix_secs;
+        self.last_commit_unix_secs = metadata.last_commit_unix_secs.unwrap_or(0);
         self.most_common_lang = metadata
             .langs
             .most_common_lang()
             .map(|l| l.to_string())
             .or_else(|| self.most_common_lang.take());
-        self.sync_status = SyncStatus::Done;
-    }
 
-    fn file_cache_path(&self, index_dir: &Path) -> PathBuf {
-        let path_hash = blake3::hash(self.disk_path.to_string_lossy().as_bytes()).to_string();
-        index_dir.join(path_hash).with_extension("json")
-    }
-
-    pub(crate) fn open_file_cache(&self, index_dir: &Path) -> FileCache {
-        let file_name = self.file_cache_path(index_dir);
-        match std::fs::File::open(file_name)
-            .map_err(anyhow::Error::from)
-            .and_then(|f| serde_json::from_reader(f).context("bad cache"))
-        {
-            Ok(cache) => Arc::new(cache),
-            Err(_) => Default::default(),
+        if let Some(ref bf) = filter_update.branch_filter {
+            self.branch_filter = bf.patch_into(self.branch_filter.as_ref());
         }
-    }
 
-    pub(crate) fn save_file_cache(
-        &self,
-        index_dir: &Path,
-        cache: FileCache,
-    ) -> Result<(), RepoError> {
-        let file_name = self.file_cache_path(index_dir);
-        pretty_write_file(file_name, cache.as_ref())
-    }
+        self.shallow = shallow;
+        self.locked = false;
 
-    pub(crate) fn delete_file_cache(&self, index_dir: &Path) {
-        _ = std::fs::remove_file(self.file_cache_path(index_dir))
+        if shallow {
+            self.sync_status = SyncStatus::Shallow
+        } else if let Some(ref ff) = filter_update.file_filter {
+            self.file_filter = ff.patch_into(&self.file_filter);
+        };
     }
 }
 
@@ -326,11 +359,11 @@ fn get_unix_time(time: SystemTime) -> u64 {
 
 #[derive(Debug)]
 pub struct RepoMetadata {
-    pub last_commit_unix_secs: u64,
+    pub last_commit_unix_secs: Option<i64>,
     pub langs: language::LanguageInfo,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Hash)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncStatus {
     /// There was an error during last sync & index
@@ -349,9 +382,10 @@ pub enum SyncStatus {
     Cancelled,
 
     /// Queued for sync & index
+    #[default]
     Queued,
 
-    /// Active VCS operation in progress
+    /// Active Git clone in progress (we don't report fetch/pull)
     Syncing,
 
     /// Active indexing in progress
@@ -359,6 +393,10 @@ pub enum SyncStatus {
 
     /// VCS remote has been removed
     RemoteRemoved,
+
+    /// There's a clone, but only usable for directory listings
+    /// through a dedicated API based on Git
+    Shallow,
 
     /// Successfully indexed
     Done,

@@ -1,4 +1,5 @@
 import { Token } from './prism';
+import { RefDefDataItem } from './api';
 import { FileTreeFileType, RepositoryFile } from './index';
 
 export type BaseSymbolType =
@@ -59,9 +60,7 @@ export type BaseResultType = {
 
 export interface CodeResult extends BaseResultType {
   relativePath: string;
-  repoPath: string;
-  branch: string;
-  code: string;
+  repoRef: string;
   snippets: Snippet[];
   type: ResultItemType.CODE;
   language: string;
@@ -78,7 +77,7 @@ export interface LangResult {
 }
 
 export interface RepoResult extends BaseResultType {
-  repository: string;
+  repoRef: string;
   branches: number;
   files: number;
   type: ResultItemType.REPO;
@@ -87,7 +86,7 @@ export interface RepoResult extends BaseResultType {
 
 export interface FileResult extends BaseResultType {
   relativePath: string;
-  repoPath: string;
+  repoRef: string;
   lines: number;
   highlights: Range[];
   type: ResultItemType.FILE;
@@ -130,7 +129,9 @@ export type FullResult = {
   language: string;
   hoverableRanges: Record<number, Range[]>;
   repoName: string;
-  fileTree?: FileTreeItem[];
+  size: number;
+  loc: number;
+  indexed: boolean;
 };
 
 export type DirectoryResult = {
@@ -155,11 +156,22 @@ export type TokenInfoFile = {
   items: TokenInfoItem[];
 };
 
-export type TokenInfoType = 'references' | 'definitions';
+export type TokenInfoType = 'reference' | 'definition';
 
 export type TokenInfo = {
   references?: TokenInfoFile[];
   definitions?: TokenInfoFile[];
+};
+
+export type TokenInfoWrapped = {
+  hoverableRange: Range | null;
+  tokenRange: Range | null;
+  lineNumber?: number;
+  isLoading: boolean;
+  data: {
+    references: { file: string; data: RefDefDataItem[] }[];
+    definitions: { file: string; data: RefDefDataItem[] }[];
+  };
 };
 
 export type ResultClick = (
@@ -171,4 +183,12 @@ export type ResultClick = (
 export type FileTreeItem = RepositoryFile & {
   children: FileTreeItem[];
   selected?: boolean;
+};
+
+export type MentionOptionType = {
+  id: string;
+  display: string;
+  type: 'file' | 'dir' | 'lang' | 'repo';
+  isFirst: boolean;
+  hint?: string;
 };

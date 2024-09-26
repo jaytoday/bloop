@@ -1,5 +1,4 @@
-import { createContext, Dispatch, SetStateAction } from 'react';
-import { EnvConfig } from '../types/general';
+import { createContext } from 'react';
 
 export type DeviceContextType = {
   openFolderInExplorer: (p: string) => void;
@@ -20,15 +19,13 @@ export type DeviceContextType = {
     platform: string;
     version: string;
   };
-  invokeTauriCommand: (c: string, payload?: any) => void;
+  invokeTauriCommand: (c: string, payload?: any) => Promise<any>;
   relaunch: () => void;
   release: string;
   apiUrl: string;
   isRepoManagementAllowed: boolean;
   forceAnalytics: boolean;
   isSelfServe: boolean;
-  envConfig: EnvConfig;
-  setEnvConfig: Dispatch<SetStateAction<EnvConfig>>;
   showNativeMessage: (m: string, options?: any) => Promise<void> | void;
 };
 
@@ -44,14 +41,12 @@ export const DeviceContext = createContext<DeviceContextType>({
     platform: '',
     version: '',
   },
-  invokeTauriCommand: () => {},
+  invokeTauriCommand: () => Promise.resolve(''),
   relaunch: () => {},
   release: '0.0.0',
   apiUrl: '',
   isRepoManagementAllowed: true,
   forceAnalytics: false,
   isSelfServe: false,
-  envConfig: {},
-  setEnvConfig: () => {},
   showNativeMessage: () => Promise.resolve(),
 });

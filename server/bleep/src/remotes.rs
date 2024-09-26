@@ -8,13 +8,13 @@ use std::{
 };
 
 use anyhow::Context;
-use gix::sec::identity::Account;
+use gix::{remote::fetch::Shallow, sec::identity::Account};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use crate::{
-    background::SyncHandle,
+    background::{SyncHandle, SyncPipes},
     remotes,
     repo::{Backend, RepoError, RepoRef, Repository, SyncStatus},
     Application,
@@ -22,10 +22,22 @@ use crate::{
 
 pub mod github;
 
-mod poll;
-pub(crate) use poll::*;
-
 type GitCreds = Account;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct CognitoGithubTokenBundle {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) github_access_token: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub(crate) enum AuthResponse {
+    Backoff { backoff_secs: u64 },
+    Success(CognitoGithubTokenBundle),
+    Error { error: String },
+}
 
 pub(crate) type Result<T> = std::result::Result<T, RemoteError>;
 #[derive(thiserror::Error, Debug)]
@@ -36,11 +48,8 @@ pub(crate) enum RemoteError {
     #[error("permission denied")]
     PermissionDenied,
 
-    #[error("syncing in progress")]
-    SyncInProgress,
-
-    #[error("invalid configuration; missing: {0}")]
-    Configuration(&'static str),
+    #[error("failed to refresh JWT token: {0}")]
+    RefreshToken(reqwest::Error),
 
     #[error("operation not supported: {0}")]
     NotSupported(&'static str),
@@ -83,6 +92,26 @@ pub(crate) enum RemoteError {
 
     #[error("git clone fetch: {0:?}")]
     GitCloneFetch(#[from] gix::clone::fetch::Error),
+
+    #[error("interrupted")]
+    Interrupted,
+}
+
+impl From<&RemoteError> for SyncStatus {
+    fn from(value: &RemoteError) -> Self {
+        SyncStatus::Error {
+            message: value.to_string(),
+        }
+    }
+}
+
+impl From<Result<SyncStatus>> for SyncStatus {
+    fn from(value: Result<SyncStatus>) -> Self {
+        match value {
+            Ok(status) => status,
+            Err(err) => (&err).into(),
+        }
+    }
 }
 
 macro_rules! creds_callback(($auth:ident) => {{
@@ -103,38 +132,69 @@ macro_rules! creds_callback(($auth:ident) => {{
     }
 }});
 
-async fn git_clone(auth: GitCreds, url: &str, target: &Path) -> Result<()> {
+async fn git_clone(
+    auth: &Option<GitCreds>,
+    url: &str,
+    target: &Path,
+    pipes: &SyncPipes,
+    shallow: Shallow,
+) -> Result<()> {
     let url = url.to_owned();
     let target = target.to_owned();
+    let auth = auth.clone();
+
+    let git_status = pipes.git_sync_progress();
+    let interrupt = pipes.is_interrupted();
 
     tokio::task::spawn_blocking(move || {
-        let clone = gix::prepare_clone_bare(url, target)?;
-        let (_repo, _outcome) = clone
-            .configure_connection(move |con| {
-                con.set_credentials(creds_callback!(auth));
-                Ok(())
-            })
-            .fetch_only(gix::progress::Discard, &false.into())?;
+        let mut clone = {
+            let c = gix::prepare_clone_bare(url, target)?.with_shallow(shallow);
+            match auth {
+                Some(auth) => c.configure_connection(move |con| {
+                    con.set_credentials(creds_callback!(auth));
+                    Ok(())
+                }),
+                None => c,
+            }
+        };
 
+        let (_repo, _outcome) = clone.fetch_only(git_status, &interrupt)?;
         Ok(())
     })
     .await?
 }
 
-async fn git_pull(auth: GitCreds, repo: &Repository) -> Result<()> {
+async fn git_pull(
+    auth: &Option<GitCreds>,
+    repo: &Repository,
+    pipes: &SyncPipes,
+    shallow: Shallow,
+) -> Result<()> {
     use gix::remote::Direction;
 
+    let auth = auth.clone();
     let disk_path = repo.disk_path.to_owned();
+
+    let interrupt = pipes.is_interrupted();
+
     tokio::task::spawn_blocking(move || {
         let repo = gix::open(disk_path)?;
         let remote = repo
             .find_default_remote(Direction::Fetch)
             .context("no remote found")??;
-        remote
-            .connect(Direction::Fetch)?
-            .with_credentials(creds_callback!(auth))
+
+        let connection = {
+            let c = remote.connect(Direction::Fetch)?;
+            match auth {
+                Some(auth) => c.with_credentials(creds_callback!(auth)),
+                None => c,
+            }
+        };
+
+        connection
             .prepare_fetch(gix::progress::Discard, Default::default())?
-            .receive(gix::progress::Discard, &false.into())?;
+            .with_shallow(shallow)
+            .receive(gix::progress::Discard, &interrupt)?;
 
         Ok(())
     })
@@ -172,12 +232,12 @@ pub(crate) fn gather_repo_roots(
                 use ignore::WalkState::*;
 
                 let Ok(de) = entry else {
-		    return Continue;
-		};
+                    return Continue;
+                };
 
                 let Some(ft) = de.file_type() else {
-		    return Continue;
-		};
+                    return Continue;
+                };
 
                 if ft.is_dir()
                     && RECOGNIZED_VCS_DIRS.contains(&de.file_name().to_string_lossy().as_ref())
@@ -207,22 +267,34 @@ pub(crate) fn gather_repo_roots(
 
 struct BackendEntry {
     inner: BackendCredential,
-    updated: flume::Receiver<()>,
-    updated_tx: flume::Sender<()>,
+}
+
+impl Serialize for BackendEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.inner.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = BackendCredential::deserialize(deserializer)?;
+        Ok(inner.into())
+    }
 }
 
 impl From<BackendCredential> for BackendEntry {
     fn from(inner: BackendCredential) -> Self {
-        let (updated_tx, updated) = flume::unbounded();
-        BackendEntry {
-            inner,
-            updated_tx,
-            updated,
-        }
+        BackendEntry { inner }
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Backends {
     /// If the environment is a Tauri app, or auth is instance-wide,
     /// This will refresh the correct user.
@@ -260,30 +332,18 @@ impl Backends {
         })
     }
 
-    pub(crate) fn set_github(&self, gh: github::State) {
+    pub(crate) fn set_github(&self, gh: impl Into<github::State>) {
+        let gh = gh.into();
         self.backends
             .entry(Backend::Github)
             .and_modify(|existing| {
                 existing.inner = BackendCredential::Github(gh.clone());
-                _ = existing.updated_tx.send(());
             })
             .or_insert_with(|| BackendCredential::Github(gh).into());
     }
 
-    pub(crate) fn github_updated(&self) -> Option<flume::Receiver<()>> {
-        self.backends
-            .read(&Backend::Github, |_, v| v.updated.clone())
-    }
-
-    pub(crate) async fn serialize(&self) -> impl Serialize + Send + Sync {
-        let mut output = HashMap::new();
-        self.backends
-            .scan_async(|k, v| {
-                output.insert(k.clone(), v.inner.clone());
-            })
-            .await;
-
-        output
+    pub(crate) async fn remove_user(&self) {
+        *self.authenticated_user.write().unwrap() = None;
     }
 
     pub(crate) async fn set_user(&self, user: String) {
@@ -301,72 +361,57 @@ pub(crate) enum BackendCredential {
 }
 
 impl BackendCredential {
-    pub(crate) async fn sync(self, sync_handle: &SyncHandle) -> Result<()> {
-        let SyncHandle { app, .. } = sync_handle;
-
+    #[tracing::instrument(fields(repo=%handle.reporef), skip_all)]
+    pub(crate) async fn clone_or_pull(
+        &self,
+        handle: &SyncHandle,
+        repo: Repository,
+    ) -> Result<SyncStatus> {
         use BackendCredential::*;
-        let existing = sync_handle.sync_lock().await;
-
         let Github(gh) = self;
-        let synced = match existing {
-            Some(Err(err)) => return Err(err),
-            Some(Ok(_)) => {
-                let repo = sync_handle
-                    .repo()
-                    .expect("repo exists & locked, this shouldn't happen");
-                gh.auth.pull_repo(repo).await
+
+        let creds = gh.auth.creds(&repo).await?;
+        let clone = || async {
+            handle.set_status(|_| SyncStatus::Syncing);
+            git_clone(
+                &creds,
+                &repo.remote.to_string(),
+                &repo.disk_path,
+                &handle.pipes,
+                handle.shallow_config.clone(),
+            )
+            .await
+        };
+        let pull = || async {
+            git_pull(&creds, &repo, &handle.pipes, handle.shallow_config.clone()).await
+        };
+
+        let synced = if repo.last_index_unix_secs == 0 && repo.disk_path.exists() {
+            // it is possible syncing was killed, but the repo is
+            // intact. pull if the dir exists, then quietly revert
+            // to cloning if that fails
+            match pull().await {
+                Ok(success) => Ok(success),
+                Err(_) if handle.pipes.is_cancelled() => Err(RemoteError::Interrupted),
+                Err(_) => clone().await,
             }
-            None => {
-                let repo = create_repository(app, sync_handle).await;
-                gh.auth.clone_repo(repo).await
+        } else if repo.last_index_unix_secs == 0 {
+            clone().await
+        } else {
+            let pulled = pull().await;
+            if pulled.is_err() && !handle.pipes.is_cancelled() {
+                clone().await
+            } else {
+                pulled
             }
         };
 
-        let new_status = match synced {
-            Ok(_) => SyncStatus::Queued,
-            Err(ref err) => {
-                let repo = sync_handle
-                    .repo()
-                    .expect("repo exists & locked, this shouldn't happen");
-
-                // try cloning again
-                _ = tokio::fs::remove_dir_all(&repo.disk_path).await;
-
-                match gh.auth.clone_repo(repo).await {
-                    Ok(_) => SyncStatus::Queued,
-                    Err(_) => SyncStatus::Error {
-                        message: err.to_string(),
-                    },
-                }
+        synced.map(|_| SyncStatus::Queued).map_err(|e| {
+            if handle.pipes.is_cancelled() {
+                RemoteError::Interrupted
+            } else {
+                e
             }
-        };
-
-        sync_handle
-            .set_status(|_| new_status)
-            .expect("unlocking repo failed, this shouldn't happen");
-
-        app.config.source.save_pool(app.repo_pool.clone())?;
-        synced
-    }
-}
-
-async fn create_repository<'a>(app: &'a Application, sync_handle: &SyncHandle) -> Repository {
-    let name = sync_handle.reporef.to_string();
-    let disk_path = app
-        .config
-        .source
-        .repo_path_for_name(&name.replace('/', "_"));
-
-    let remote = sync_handle.reporef.as_ref().into();
-
-    sync_handle
-        .create_new(|| Repository {
-            disk_path,
-            remote,
-            sync_status: SyncStatus::Syncing,
-            last_index_unix_secs: 0,
-            last_commit_unix_secs: 0,
-            most_common_lang: None,
         })
-        .await
+    }
 }

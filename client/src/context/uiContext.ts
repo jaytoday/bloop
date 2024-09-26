@@ -1,48 +1,60 @@
-import React, { createContext } from 'react';
+import { createContext, Dispatch, SetStateAction } from 'react';
 import { Theme } from '../types';
+import {
+  ChatInputType,
+  OnboardingStateType,
+  ProjectSettingSections,
+  SettingSections,
+} from '../types/general';
 
-type ContextType = {
-  isSettingsOpen: boolean;
-  setSettingsOpen: (v: boolean) => void;
-  symbolsCollapsed: boolean;
-  setSymbolsCollapsed: (v: boolean) => void;
-  settingsSection: number;
-  setSettingsSection: (s: number) => void;
-  onBoardingState: Record<string, any>;
-  setOnBoardingState: React.Dispatch<React.SetStateAction<Record<string, any>>>;
-  isBugReportModalOpen: boolean;
-  setBugReportModalOpen: (b: boolean) => void;
-  isGithubConnected: boolean;
-  setGithubConnected: (b: boolean) => void;
-  isGithubChecked: boolean;
-  shouldShowWelcome: boolean;
-  setShouldShowWelcome: (b: boolean) => void;
-  isRightPanelOpen: boolean;
-  setRightPanelOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  tab: { key: string; name: string; repoName: string };
-  theme: Theme;
-  setTheme: (s: Theme) => void;
+export const UIContext = {
+  Settings: createContext({
+    isSettingsOpen: false,
+    setSettingsOpen: (b: boolean) => {},
+    settingsSection: SettingSections.GENERAL,
+    setSettingsSection: (s: SettingSections) => {},
+  }),
+  ProjectSettings: createContext({
+    isProjectSettingsOpen: false,
+    setProjectSettingsOpen: (b: boolean) => {},
+    projectSettingsSection: ProjectSettingSections.GENERAL,
+    setProjectSettingsSection: (s: ProjectSettingSections) => {},
+  }),
+  Onboarding: createContext<{
+    shouldShowWelcome: boolean;
+    setShouldShowWelcome: Dispatch<SetStateAction<boolean>>;
+    onBoardingState: OnboardingStateType;
+    setOnBoardingState: Dispatch<SetStateAction<OnboardingStateType>>;
+  }>({
+    shouldShowWelcome: false,
+    setShouldShowWelcome: () => {},
+    onBoardingState: {},
+    setOnBoardingState: () => {},
+  }),
+  BugReport: createContext({
+    isBugReportModalOpen: false,
+    setBugReportModalOpen: (b: boolean) => {},
+  }),
+  GitHubConnected: createContext({
+    isGithubConnected: false,
+    setGithubConnected: (b: boolean) => {},
+    isGithubChecked: false,
+    refreshToken: (refreshT: string) => Promise.resolve(),
+  }),
+  Theme: createContext({
+    theme: 'system' as Theme,
+    setTheme: (t: Theme) => {},
+  }),
+  Focus: createContext({
+    isLeftSidebarFocused: false,
+    setIsLeftSidebarFocused: (b: boolean) => {},
+  }),
+  UpgradeRequiredPopup: createContext({
+    isUpgradeRequiredPopupOpen: false,
+    setIsUpgradeRequiredPopupOpen: (b: boolean) => {},
+  }),
+  ChatInputType: createContext({
+    chatInputType: 'default' as ChatInputType,
+    setChatInputType: (t: ChatInputType) => {},
+  }),
 };
-
-export const UIContext = createContext<ContextType>({
-  isSettingsOpen: false,
-  setSettingsOpen: (b) => {},
-  symbolsCollapsed: true,
-  setSymbolsCollapsed: (b) => {},
-  settingsSection: 0,
-  setSettingsSection: (s) => {},
-  onBoardingState: {},
-  setOnBoardingState: (state: Record<string, any>) => {},
-  isBugReportModalOpen: false,
-  setBugReportModalOpen: () => {},
-  isGithubConnected: false,
-  setGithubConnected: () => {},
-  isGithubChecked: false,
-  shouldShowWelcome: false,
-  setShouldShowWelcome: () => {},
-  isRightPanelOpen: false,
-  setRightPanelOpen: () => {},
-  tab: { key: 'initial', name: 'Home', repoName: '' },
-  theme: 'system',
-  setTheme: () => {},
-});

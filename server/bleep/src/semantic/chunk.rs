@@ -8,7 +8,7 @@ use crate::text_range::{Point, TextRange};
 use clap::{builder::PossibleValue, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
-use tracing::{debug, error, warn};
+use tracing::{error, trace, warn};
 
 #[derive(Debug)]
 pub enum ChunkError {
@@ -155,6 +155,24 @@ impl Default for OverlapStrategy {
     }
 }
 
+/// Heuristics for determining if a chunk is noisy
+///
+/// We filter chunks where over 50% of non-whitespace tokens are numeric or punctuation
+fn is_noisy(chunk: &str) -> bool {
+    let non_whitespace_count = chunk.chars().filter(|c| !c.is_whitespace()).count();
+    let numeric_or_punctuation_count = chunk
+        .chars()
+        .filter(|c| c.is_numeric() || c.is_ascii_punctuation())
+        .count();
+
+    // Chunks that are all whitespace are noisy
+    if non_whitespace_count == 0 {
+        return true;
+    }
+
+    (numeric_or_punctuation_count as f64 / non_whitespace_count as f64) > 0.5
+}
+
 /// This should take care of [CLS], [SEP] etc. which could be introduced during per-chunk tokenization
 pub const DEDUCT_SPECIAL_TOKENS: usize = 2;
 
@@ -170,6 +188,11 @@ fn add_token_range<'s>(
     let end_byte = offsets.get(o.end).map_or(src.len(), |&(s, _)| s);
 
     if end_byte <= start_byte {
+        return;
+    }
+
+    if is_noisy(&src[start_byte..end_byte]) {
+        trace!("skipping noisy chunk");
         return;
     }
 
@@ -195,12 +218,13 @@ pub fn by_tokens<'s>(
     src: &'s str,
     tokenizer: &Tokenizer, // we count from line
     token_bounds: Range<usize>,
-    max_lines: usize,
     strategy: OverlapStrategy,
 ) -> Vec<Chunk<'s>> {
     if tokenizer.get_padding().is_some() || tokenizer.get_truncation().is_some() {
         error!(
-            "This code can panic if padding and truncation are not turned off. Please make sure padding is off."
+            "This code can panic if padding and truncation are not turned off. Please make sure padding is off. p = {}, t = {}",
+            tokenizer.get_padding().is_some(),
+            tokenizer.get_truncation().is_some(),
         );
     }
     let min_tokens = token_bounds.start;
@@ -208,10 +232,9 @@ pub fn by_tokens<'s>(
     if src.len() < min_tokens {
         return Vec::new();
     }
-    let Ok(encoding) = tokenizer.encode(src, true)
-    else {
+    let Ok(encoding) = tokenizer.encode(src, true) else {
         warn!("Could not encode \"{}\"", src);
-        return by_lines(src, max_lines);
+        return by_lines(src, 15);
     };
 
     let offsets = encoding.get_offsets();
@@ -237,7 +260,7 @@ pub fn by_tokens<'s>(
     let max_tokens = token_bounds.end - DEDUCT_SPECIAL_TOKENS - repo_tokens;
     let max_newline_tokens = max_tokens * 3 / 4; //TODO: make this configurable
     let max_boundary_tokens = max_tokens * 7 / 8; //TODO: make this configurable
-    debug!("max tokens reduced to {max_tokens}");
+    trace!("max tokens reduced to {max_tokens}");
 
     let offsets_len = offsets.len() - 1;
     // remove the SEP token which has (0, 0) offsets for some reason
@@ -344,12 +367,17 @@ pub fn by_lines(src: &str, size: usize) -> Vec<Chunk<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+    use std::{env, path::PathBuf};
 
     fn minilm() -> Tokenizer {
-        let cur_dir = env::current_dir().unwrap();
-        let base_dir = cur_dir.ancestors().nth(2).unwrap();
-        let tok_json = base_dir.join("model/tokenizer.json");
+        let tok_json = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("model")
+            .join("tokenizer.json");
+        println!("{tok_json:?}");
         let tokenizer = tokenizers::Tokenizer::from_file(tok_json).unwrap();
         tokenizer
     }
@@ -358,14 +386,12 @@ mod tests {
     pub fn empty() {
         let tokenizer = minilm();
         let token_bounds = 50..256;
-        let max_lines = 15;
         let no_tokens = super::by_tokens(
             "bloop",
             "rmpty.rs",
             "",
             &tokenizer,
             token_bounds,
-            max_lines,
             OverlapStrategy::ByLines(1),
         );
         assert!(no_tokens.is_empty());
@@ -375,11 +401,24 @@ mod tests {
     pub fn by_tokens() {
         let tokenizer = minilm();
         let token_bounds = 50..256;
-        let max_lines = 15;
         let cur_dir = env::current_dir().unwrap();
         let base_dir = cur_dir.ancestors().nth(2).unwrap();
         let walk = ignore::WalkBuilder::new(base_dir)
             .standard_filters(true)
+            .filter_entry(|de| {
+                let Some(ft) = de.file_type() else {
+                    return false;
+                };
+
+                // pretty crude, but do ignore generated files
+                if ft.is_dir() && de.file_name() == "target" {
+                    return false;
+                }
+
+                let is_file = ft.is_file() || ft.is_symlink();
+
+                !is_file || de.path().extension().map(|e| e == "rs").unwrap_or_default()
+            })
             .build();
         let mut num_chunks = 0;
         let mut combined_size = 0;
@@ -388,14 +427,15 @@ mod tests {
             if file.metadata().unwrap().is_dir() {
                 continue;
             }
-            let Ok(src) = std::fs::read_to_string(file.path()) else { continue };
+            let Ok(src) = std::fs::read_to_string(file.path()) else {
+                continue;
+            };
             let chunks = super::by_tokens(
                 "bloop",
                 &file.path().to_string_lossy(),
                 &src,
                 &tokenizer,
                 token_bounds.clone(),
-                max_lines,
                 OverlapStrategy::Partial(0.5),
             );
             num_chunks += chunks.len();
@@ -415,7 +455,6 @@ mod tests {
     #[test]
     pub fn chunks_within_token_limit() {
         let tokenizer = minilm();
-        let max_lines = 15;
 
         let chunks = super::by_tokens(
             "bloop",
@@ -423,7 +462,6 @@ mod tests {
             SRC,
             &tokenizer,
             50..256,
-            max_lines,
             OverlapStrategy::Partial(0.5),
         );
 
@@ -440,7 +478,6 @@ mod tests {
     #[test]
     pub fn chunks_over_long_lined_file() {
         let tokenizer = minilm();
-        let max_lines = 15;
 
         // squish SRC into one big single-lined string
         let src = SRC.lines().collect::<String>();
@@ -451,7 +488,6 @@ mod tests {
             &src,
             &tokenizer,
             50..256,
-            max_lines,
             OverlapStrategy::Partial(0.5),
         );
 

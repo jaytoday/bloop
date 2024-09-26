@@ -1,6 +1,14 @@
-import { MouseEvent, useCallback } from 'react';
+import { MouseEvent } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { RepoType, RepoUi } from '../types/general';
+import { es, ja, zhCN } from 'date-fns/locale';
+import {
+  LocaleType,
+  ParsedQueryType,
+  ParsedQueryTypeEnum,
+  RepoType,
+  RepoUi,
+} from '../types/general';
+import { PathParts } from '../components/Breadcrumbs';
 import langs from './langs.json';
 
 export const copyToClipboard = (value: string) => {
@@ -64,12 +72,33 @@ export const parseFilters = (input: string) => {
   return filters;
 };
 
-export const getFileExtensionForLang = (lang: string) => {
+export const getFileExtensionForLang = (lang: string, lowercased?: boolean) => {
   if (!lang) {
     return 'default';
   }
   // @ts-ignore
-  return 'index' + langs[lang]?.[0];
+  let ext = langs[lang]?.[0];
+  if (lowercased) {
+    const key = Object.keys(langs).find((key) => key?.toLowerCase() === lang);
+    if (key) {
+      // @ts-ignore
+      ext = langs[key]?.[0];
+    }
+  }
+  return 'index' + (ext || `.${lang}`);
+};
+
+export const getPrettyLangName = (lang: string) => {
+  switch (lang) {
+    case 'js':
+    case 'jsx':
+      return 'JavaScript';
+    case 'ts':
+    case 'tsx':
+      return 'TypeScript';
+    default:
+      return Object.keys(langs).find((key) => key?.toLowerCase() === lang);
+  }
 };
 
 export const isWindowsPath = (path: string) => path.includes('\\');
@@ -93,27 +122,33 @@ export const splitPath = (path: string) =>
 export const splitPathForBreadcrumbs = (
   path: string,
   onClick?: (
-    e: MouseEvent<HTMLButtonElement>,
+    e: MouseEvent | null,
     item: string,
     index: number,
     arr: string[],
   ) => void,
-) => {
+): PathParts[] => {
   return splitPath(path)
     .filter((p) => p !== '/')
-    .map((item, index, arr) => ({
-      label: item,
-      onClick: (e: MouseEvent<HTMLButtonElement>) => {
-        e.preventDefault();
-        onClick?.(e, item, index, arr);
-      },
-    }));
+    .map(
+      (item, index, arr): PathParts => ({
+        label: item,
+        onClick: (e?: MouseEvent) => {
+          e?.preventDefault();
+          onClick?.(e || null, item, index, arr);
+        },
+      }),
+    );
 };
 
-export const buildRepoQuery = (repo?: string, path?: string) => {
+export const buildRepoQuery = (
+  repo?: string,
+  path?: string,
+  selectedBranch?: string | null,
+) => {
   return `open:true ${repo ? `repo:${repo}` : ''} ${
-    path ? `path:${path}` : ''
-  }`;
+    path ? `path:${path.includes(' ') ? `"${path}"` : path}` : ''
+  }${selectedBranch ? ` branch:${selectedBranch}` : ''}`;
 };
 
 export const getFileManagerName = (os: string) => {
@@ -216,18 +251,9 @@ export const generateUniqueId = (): string => {
   return uuidv4();
 };
 
-export const propsAreShallowEqual = <P>(
-  prevProps: Readonly<P>,
-  nextProps: Readonly<P>,
-) =>
-  Object.keys(prevProps).every(
-    (k) =>
-      prevProps[k as keyof typeof prevProps] ===
-      nextProps[k as keyof typeof nextProps],
-  );
-
 export const deleteAuthCookie = () => {
-  document.cookie = 'auth_cookie=;expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+  document.cookie =
+    'X-Bleep-Cognito=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
 };
 
 export const previewTheme = (key: string) => {
@@ -238,3 +264,210 @@ export const previewTheme = (key: string) => {
     300, // longest color transition
   );
 };
+
+export const calculatePopupPositionInsideContainer = (
+  top: number,
+  left: number,
+  containerRect: DOMRect,
+) => {
+  const viewportWidth =
+    window.innerWidth || document.documentElement.clientWidth;
+  const viewportHeight =
+    window.innerHeight || document.documentElement.clientHeight;
+
+  const popupWidth = 170; // Adjust as needed
+  const popupHeight = 34; // Adjust as needed
+
+  top -= popupHeight + 15;
+
+  // Adjust top position to ensure the popup stays within the container
+  if (top < containerRect.top) {
+    top = containerRect.top;
+  } else if (top > containerRect.bottom) {
+    top = containerRect.bottom - popupHeight;
+  }
+
+  // Adjust left position to ensure the popup stays within the container
+  if (left < containerRect.left) {
+    left = containerRect.left;
+  } else if (left > containerRect.right) {
+    left = containerRect.right - popupWidth;
+  }
+
+  // Adjust top position to ensure the popup stays within the viewport
+  if (top < 0) {
+    top = 0;
+  } else if (top + popupHeight > viewportHeight) {
+    top = viewportHeight - popupHeight;
+  }
+
+  // Adjust left position to ensure the popup stays within the viewport
+  if (left < 0) {
+    left = 0;
+  } else if (left + popupWidth > viewportWidth) {
+    left = viewportWidth - popupWidth;
+  }
+
+  return { top, left };
+};
+
+function getLineNumber(element: HTMLElement | null) {
+  while (element) {
+    if (element?.dataset?.['line-number'] || element?.dataset?.lineNumber) {
+      return element.dataset['line-number'] || element.dataset.lineNumber;
+    }
+    element = element.parentElement;
+  }
+  return null;
+}
+
+export function getSelectionLines(element: HTMLElement): null | number {
+  if (!element) {
+    return null;
+  }
+
+  const lineNumber = getLineNumber(element);
+
+  return lineNumber ? Number(lineNumber) : null;
+}
+
+export const escapeHtml = (unsafe: string) => {
+  return unsafe
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+};
+
+export function humanFileSize(
+  bytes: number,
+  si: boolean = true,
+  dp: number = 1,
+) {
+  const thresh = si ? 1000 : 1024;
+
+  if (Math.abs(bytes) < thresh) {
+    return bytes + ' B';
+  }
+
+  const units = si
+    ? ['kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+    : ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
+  let u = -1;
+  const r = 10 ** dp;
+
+  do {
+    bytes /= thresh;
+    ++u;
+  } while (
+    Math.round(Math.abs(bytes) * r) / r >= thresh &&
+    u < units.length - 1
+  );
+
+  return bytes.toFixed(dp) + ' ' + units[u];
+}
+
+export function humanNumber(num: number) {
+  if (!num) {
+    return num;
+  }
+  if (num < 1000) {
+    return num.toString();
+  }
+  return `${parseFloat((num / 1000).toFixed(1))}k`;
+}
+
+export const getDateFnsLocale = (locale: LocaleType) => {
+  switch (locale) {
+    case 'ja':
+      return { locale: ja };
+    case 'zhCN':
+      return { locale: zhCN };
+    case 'es':
+      return { locale: es };
+    default:
+      return undefined;
+  }
+};
+
+export function mergeRanges(ranges: [number, number][]): [number, number][] {
+  ranges.sort((a, b) => a[0] - b[0]);
+
+  const mergedRanges: [number, number][] = [];
+
+  if (ranges.length === 0) {
+    return mergedRanges;
+  }
+
+  let currentRange = ranges[0];
+
+  for (let i = 1; i < ranges.length; i++) {
+    const nextRange = ranges[i];
+
+    if (nextRange[0] <= currentRange[1] + 1) {
+      currentRange[1] = Math.max(currentRange[1], nextRange[1]);
+    } else {
+      mergedRanges.push(currentRange);
+      currentRange = nextRange;
+    }
+  }
+
+  mergedRanges.push(currentRange);
+
+  return mergedRanges;
+}
+
+export function splitUserInputAfterAutocomplete(
+  input: string,
+): ParsedQueryType[] {
+  const pathRegex = /\|path:(.*?)\|/g;
+  const langRegex = /\|lang:(.*?)\|/g;
+  const combinedRegex = /\|(path|lang|repo):(.*?)\|/g;
+  const result: ParsedQueryType[] = [];
+
+  let lastIndex = 0;
+
+  const addTextContent = (text: string) => {
+    if (text.length > 0) {
+      result.push({ type: ParsedQueryTypeEnum.TEXT, text });
+    }
+  };
+
+  input.replace(combinedRegex, (_, type, text, index) => {
+    addTextContent(input.substring(lastIndex, index));
+    result.push({
+      type:
+        type === 'lang'
+          ? ParsedQueryTypeEnum.LANG
+          : type === 'repo'
+          ? ParsedQueryTypeEnum.REPO
+          : ParsedQueryTypeEnum.PATH,
+      text,
+    });
+    lastIndex = index + text.length + type.length + 3; // 3 is the length of "(type:"
+    return '';
+  });
+
+  addTextContent(input.substring(lastIndex));
+
+  return result;
+}
+
+export function concatenateParsedQuery(query: ParsedQueryType[]) {
+  let result = '';
+  query.forEach((q) => {
+    if (q.type === ParsedQueryTypeEnum.TEXT) {
+      result += q.text;
+    } else if (q.type === ParsedQueryTypeEnum.PATH) {
+      result += `|path:${q.text}|`;
+    } else if (q.type === ParsedQueryTypeEnum.LANG) {
+      result += `|lang:${q.text}|`;
+    } else if (q.type === ParsedQueryTypeEnum.REPO) {
+      result += `|repo:${q.text}|`;
+    }
+  });
+  return result;
+}
+
+export const noOp = () => {};

@@ -1,90 +1,187 @@
 use crate::{env::Feature, Application};
 
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Extension, Json};
-use std::{borrow::Cow, net::SocketAddr};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post},
+    Extension, Json,
+};
+use std::{borrow::Cow, fmt, net::SocketAddr};
 use tower::Service;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::{catch_panic::CatchPanicLayer, cors::CorsLayer};
 use tracing::info;
 
-mod aaa;
+pub mod aaa;
 pub mod answer;
 mod autocomplete;
+mod commits;
 mod config;
+pub mod conversation;
+mod docs;
 mod file;
 mod github;
-mod hoverable;
+pub mod hoverable;
 mod index;
-mod intelligence;
+pub mod intelligence;
 pub mod middleware;
+mod project;
 mod query;
-mod repos;
-mod semantic;
+mod quota;
+pub mod repos;
+mod search;
+mod studio;
+mod template;
 
 pub type Router<S = Application> = axum::Router<S>;
 
 #[allow(unused)]
-pub(in crate::webserver) mod prelude {
-    pub(in crate::webserver) use super::{json, EndpointError, Error, ErrorKind, Result, Router};
-    pub(in crate::webserver) use crate::indexes::Indexes;
-    pub(in crate::webserver) use axum::{
-        extract::Query, http::StatusCode, response::IntoResponse, Extension,
-    };
-    pub(in crate::webserver) use serde::{Deserialize, Serialize};
-    pub(in crate::webserver) use std::sync::Arc;
+pub(crate) mod prelude {
+    pub(crate) use super::{json, EndpointError, Error, ErrorKind, Result, Router};
+    pub(crate) use crate::indexes::Indexes;
+    pub(crate) use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension};
+    pub(crate) use serde::{Deserialize, Serialize};
+    pub(crate) use std::sync::Arc;
 }
 
 pub async fn start(app: Application) -> anyhow::Result<()> {
     let bind = SocketAddr::new(app.config.host.parse()?, app.config.port);
 
     let mut api = Router::new()
-        .route("/config", get(config::handle))
-        // querying
-        .route("/q", get(query::handle))
-        // autocomplete
-        .route("/autocomplete", get(autocomplete::handle))
+        .route("/config", get(config::get).put(config::put))
         // indexing
         .route("/index", get(index::handle))
         // repo management
-        .route("/repos", get(repos::available))
-        .route("/repos/status", get(repos::index_status))
-        .route(
-            "/repos/indexed",
-            get(repos::indexed).put(repos::set_indexed),
-        )
-        .route(
-            "/repos/indexed/*path",
-            get(repos::get_by_id).delete(repos::delete_by_id),
-        )
-        .route(
-            "/repos/sync/*path",
-            get(repos::sync).delete(repos::delete_sync),
+        .nest("/repos", repos::router())
+        // docs management
+        .nest(
+            "/docs",
+            Router::new()
+                .route("/", get(docs::list)) // list all doc providers
+                .route("/search", get(docs::search)) // text search over doc providers
+                .route("/enqueue", get(docs::enqueue)) // enqueue a new url to begin syncing
+                .route("/verify", get(docs::verify)) // verify if a doc url is valid
+                .route("/:id", get(docs::list_one)) // list a doc provider by id
+                .route("/:id", delete(docs::delete)) // delete a doc provider by id
+                .route("/:id/resync", get(docs::resync)) // resync a doc provider by id
+                .route("/:id/status", get(docs::status)) // query sync status of an existing doc source
+                .route("/:id/cancel", get(docs::cancel)) // cancel an index job
+                .route("/:id/search", get(docs::search_with_id)) // search/list sections of a doc provider
+                .route("/:id/list", get(docs::list_with_id)) // list pages of a doc provider
+                .route("/:id/fetch", get(docs::fetch)), // fetch all sections of a page of a doc provider
         )
         // intelligence
+        .route("/tutorial-questions", get(commits::tutorial_questions))
         .route("/hoverable", get(hoverable::handle))
         .route("/token-info", get(intelligence::handle))
-        // misc
-        .route("/search", get(semantic::complex_search))
-        .route("/file", get(file::handle))
-        .route("/answer", get(answer::handle))
+        .route("/related-files", get(intelligence::related_files))
         .route(
-            "/answer/conversations",
-            get(answer::conversations::list).delete(answer::conversations::delete),
+            "/related-files-with-ranges",
+            get(intelligence::related_file_with_ranges),
+        )
+        .route("/token-value", get(intelligence::token_value))
+        // misc
+        .route("/search/code", get(search::semantic_code))
+        .route("/file", get(file::handle))
+        .route("/folder", get(file::folder))
+        .route("/projects", get(project::list).post(project::create))
+        .route(
+            "/projects/:project_id",
+            get(project::get)
+                .put(project::update)
+                .delete(project::delete),
         )
         .route(
-            "/answer/conversations/:thread_id",
-            get(answer::conversations::thread),
+            "/projects/:project_id/repos",
+            get(project::repo::list).post(project::repo::add),
+        )
+        .route(
+            "/projects/:project_id/repos/",
+            delete(project::repo::delete).put(project::repo::put),
+        )
+        .route(
+            "/projects/:project_id/docs",
+            get(project::doc::list).post(project::doc::add),
+        )
+        .route(
+            "/projects/:project_id/docs/:doc_id",
+            delete(project::doc::delete),
+        )
+        .route(
+            "/projects/:project_id/conversations",
+            get(conversation::list),
+        )
+        .route(
+            "/projects/:project_id/conversations/:conversation_id",
+            get(conversation::get).delete(conversation::delete),
+        )
+        .route("/projects/:project_id/q", get(query::handle))
+        .route(
+            "/projects/:project_id/autocomplete",
+            get(autocomplete::handle),
+        )
+        .route("/projects/:project_id/search/path", get(search::fuzzy_path))
+        .route("/projects/:project_id/answer/vote", post(answer::vote))
+        .route("/projects/:project_id/answer", get(answer::answer))
+        .route("/projects/:project_id/answer/explain", get(answer::explain))
+        .route("/projects/:project_id/studios", post(studio::create))
+        .route("/projects/:project_id/studios", get(studio::list))
+        .route(
+            "/projects/:project_id/studios/:studio_id",
+            get(studio::get).patch(studio::patch).delete(studio::delete),
+        )
+        .route("/projects/:project_id/studios/import", post(studio::import))
+        .route(
+            "/projects/:project_id/studios/:studio_id/generate",
+            get(studio::generate),
+        )
+        .route(
+            "/projects/:project_id/studios/:studio_id/diff",
+            get(studio::diff),
+        )
+        .route(
+            "/projects/:project_id/studios/:studio_id/diff/apply",
+            post(studio::diff_apply),
+        )
+        .route(
+            "/projects/:project_id/studios/:studio_id/snapshots",
+            get(studio::list_snapshots),
+        )
+        .route(
+            "/projects/:project_id/studios/:studio_id/snapshots/:snapshot_id",
+            delete(studio::delete_snapshot),
+        )
+        .route(
+            "/projects/:project_id/studios/file-token-count",
+            post(studio::get_file_token_count),
+        )
+        .route(
+            "/projects/:project_id/studios/doc-file-token-count",
+            post(studio::get_doc_file_token_count),
+        )
+        .route("/template", post(template::create))
+        .route("/template", get(template::list))
+        .route(
+            "/template/:id",
+            get(template::get)
+                .patch(template::patch)
+                .delete(template::delete),
+        )
+        .route("/quota", get(quota::get))
+        .route(
+            "/quota/create-checkout-session",
+            get(quota::create_checkout_session),
         );
 
     if app.env.allow(Feature::AnyPathScan) {
         api = api.route("/repos/scan", get(repos::scan_local));
     }
 
-    if app.env.allow(Feature::GithubDeviceFlow) {
+    if app.env.allow(Feature::DesktopUserAuth) {
         api = api
-            .route("/remotes/github/login", get(github::login))
-            .route("/remotes/github/logout", get(github::logout))
-            .route("/remotes/github/status", get(github::status));
+            .route("/auth/login", get(github::login))
+            .route("/auth/logout", get(github::logout));
     }
 
     api = api.route("/panic", get(|| async { panic!("dead") }));
@@ -92,7 +189,7 @@ pub async fn start(app: Application) -> anyhow::Result<()> {
     // Note: all routes above this point must be authenticated.
     // These middlewares MUST provide the `middleware::User` extension.
     if app.env.allow(Feature::AuthorizationRequired) {
-        api = aaa::router(middleware::sentry_layer(api), app.clone());
+        api = aaa::router(middleware::sentry_layer(api), app.clone()).await;
     } else {
         api = middleware::local_user(middleware::sentry_layer(api), app.clone());
     }
@@ -133,18 +230,25 @@ pub async fn start(app: Application) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn json<'a, T>(val: T) -> Json<Response<'a>>
+pub(crate) fn json<'a, T>(val: T) -> Json<Response<'a>>
 where
     Response<'a>: From<T>,
 {
     Json(Response::from(val))
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-struct Error {
+#[derive(Debug)]
+pub struct Error {
     status: StatusCode,
-    body: Json<Response<'static>>,
+    body: EndpointError<'static>,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.body.message)
+    }
 }
 
 impl Error {
@@ -159,10 +263,10 @@ impl Error {
             ErrorKind::NotFound => StatusCode::NOT_FOUND,
         };
 
-        let body = Json(Response::from(EndpointError {
+        let body = EndpointError {
             kind,
             message: message.into(),
-        }));
+        };
 
         Error { status, body }
     }
@@ -175,46 +279,69 @@ impl Error {
     fn internal<S: std::fmt::Display>(message: S) -> Self {
         Error {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: Json(Response::from(EndpointError {
+            body: EndpointError {
                 kind: ErrorKind::Internal,
                 message: message.to_string().into(),
-            })),
+            },
         }
     }
 
     fn user<S: std::fmt::Display>(message: S) -> Self {
         Error {
             status: StatusCode::BAD_REQUEST,
-            body: Json(Response::from(EndpointError {
+            body: EndpointError {
                 kind: ErrorKind::User,
                 message: message.to_string().into(),
-            })),
+            },
+        }
+    }
+
+    fn not_found<S: std::fmt::Display>(message: S) -> Self {
+        Error {
+            status: StatusCode::NOT_FOUND,
+            body: EndpointError {
+                kind: ErrorKind::NotFound,
+                message: message.to_string().into(),
+            },
+        }
+    }
+
+    fn unauthorized<S: std::fmt::Display>(message: S) -> Self {
+        Error {
+            status: StatusCode::UNAUTHORIZED,
+            body: EndpointError {
+                kind: ErrorKind::User,
+                message: message.to_string().into(),
+            },
         }
     }
 
     fn message(&self) -> &str {
-        match &self.body {
-            Json(Response::Error(EndpointError { message, .. })) => message.as_ref(),
-            _ => "",
-        }
+        self.body.message.as_ref()
     }
 }
 
 impl From<anyhow::Error> for Error {
     fn from(value: anyhow::Error) -> Self {
-        Error::internal(value.to_string())
+        Error::internal(value)
+    }
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(value: sqlx::Error) -> Self {
+        Error::internal(value)
     }
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
-        (self.status, self.body).into_response()
+        (self.status, Json(Response::from(self.body))).into_response()
     }
 }
 
 /// The response upon encountering an error
 #[derive(serde::Serialize, PartialEq, Eq, Debug)]
-struct EndpointError<'a> {
+pub struct EndpointError<'a> {
     /// The kind of this error
     kind: ErrorKind,
 
@@ -227,7 +354,7 @@ struct EndpointError<'a> {
 #[derive(serde::Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-enum ErrorKind {
+pub enum ErrorKind {
     User,
     Unknown,
     NotFound,
@@ -247,7 +374,7 @@ erased_serde::serialize_trait_object!(ApiResponse);
 #[derive(serde::Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-enum Response<'a> {
+pub(crate) enum Response<'a> {
     Ok(Box<dyn erased_serde::Serialize + Send + Sync + 'static>),
     Error(EndpointError<'a>),
 }
@@ -264,10 +391,12 @@ impl<'a> From<EndpointError<'a>> for Response<'a> {
     }
 }
 
-async fn health(Extension(app): Extension<Application>) {
-    if let Some(ref semantic) = app.semantic {
-        // panic is fine here, we don't need exact reporting of
-        // subsystem checks at this stage
-        semantic.health_check().await.unwrap()
-    }
+async fn health(State(app): State<Application>) {
+    // panic is fine here, we don't need exact reporting of
+    // subsystem checks at this stage
+    app.semantic.health_check().await.unwrap()
+}
+
+fn no_user_id() -> Error {
+    Error::user("didn't have user ID")
 }

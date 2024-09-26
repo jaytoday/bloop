@@ -1,5 +1,3 @@
-use std::path::MAIN_SEPARATOR;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use tantivy::{
@@ -9,11 +7,14 @@ use tantivy::{
 
 use super::{file::File, repo::Repo, DocumentRead};
 use crate::{
+    intelligence::TreeSitterFile,
     query::{
         compiler::Compiler,
         parser::{self, Query, Target},
     },
+    repo::RepoRef,
     symbol::SymbolLocations,
+    text_range::TextRange,
 };
 
 #[derive(Default, Debug, Clone)]
@@ -26,15 +27,45 @@ pub struct ContentDocument {
     pub line_end_indices: Vec<u32>,
     pub symbol_locations: SymbolLocations,
     pub branches: Option<String>,
+    pub indexed: bool,
+}
+
+impl std::hash::Hash for ContentDocument {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.repo_ref.hash(state);
+        self.branches.hash(state);
+        self.relative_path.hash(state);
+        self.content.hash(state);
+    }
+}
+
+impl PartialEq for ContentDocument {
+    fn eq(&self, other: &Self) -> bool {
+        self.repo_ref == other.repo_ref
+            && self.branches == other.branches
+            && self.relative_path == other.relative_path
+            && self.content == other.content
+    }
+}
+impl Eq for ContentDocument {}
+
+impl ContentDocument {
+    pub fn hoverable_ranges(&self) -> Option<Vec<TextRange>> {
+        TreeSitterFile::try_build(self.content.as_bytes(), self.lang.as_ref()?)
+            .and_then(TreeSitterFile::hoverable_ranges)
+            .ok()
+    }
 }
 
 #[derive(Debug)]
 pub struct FileDocument {
     pub relative_path: String,
     pub repo_name: String,
-    pub repo_ref: String,
+    pub repo_ref: RepoRef,
     pub lang: Option<String>,
-    pub branches: Option<String>,
+    pub branches: String,
+    pub indexed: bool,
+    pub is_dir: bool,
 }
 
 pub struct RepoDocument {
@@ -75,7 +106,7 @@ impl DocumentRead for ContentReader {
             .literal(schema.relative_path, |q| q.path.clone())
             .literal(schema.repo_name, |q| q.repo.clone())
             .literal(schema.branches, |q| q.branch.clone())
-            .byte_string(schema.lang, |q| q.lang.as_ref())
+            .byte_string(schema.lang, |q| q.lang.as_ref().map(AsRef::as_ref))
             .literal(schema.symbols, |q| {
                 q.target.as_ref().and_then(Target::symbol).cloned()
             })
@@ -92,6 +123,7 @@ impl DocumentRead for ContentReader {
         let content = read_text_field(&doc, schema.content);
         let lang = read_lang_field(&doc, schema.lang);
         let branches = read_lang_field(&doc, schema.branches);
+        let indexed = read_bool_field(&doc, schema.indexed);
 
         let line_end_indices = doc
             .get_first(schema.line_end_indices)
@@ -119,6 +151,7 @@ impl DocumentRead for ContentReader {
             line_end_indices,
             lang,
             branches,
+            indexed,
         }
     }
 }
@@ -164,16 +197,18 @@ impl DocumentRead for FileReader {
             .literal(schema.relative_path, |q| q.path.clone())
             .literal(schema.repo_name, |q| q.repo.clone())
             .literal(schema.branches, |q| q.branch.clone())
-            .byte_string(schema.lang, |q| q.lang.as_ref())
+            .byte_string(schema.lang, |q| q.lang.as_ref().map(AsRef::as_ref))
             .compile(queries, tantivy_index)
     }
 
     fn read_document(&self, schema: &Self::Schema, doc: tantivy::Document) -> Self::Document {
         let relative_path = read_text_field(&doc, schema.relative_path);
-        let repo_ref = read_text_field(&doc, schema.repo_ref);
+        let repo_ref = read_text_field(&doc, schema.repo_ref).parse().unwrap();
         let repo_name = read_text_field(&doc, schema.repo_name);
         let lang = read_lang_field(&doc, schema.lang);
-        let branches = read_lang_field(&doc, schema.branches);
+        let branches = read_text_field(&doc, schema.branches);
+        let indexed = read_bool_field(&doc, schema.indexed);
+        let is_dir = read_bool_field(&doc, schema.is_directory);
 
         FileDocument {
             relative_path,
@@ -181,6 +216,8 @@ impl DocumentRead for FileReader {
             repo_ref,
             lang,
             branches,
+            indexed,
+            is_dir,
         }
     }
 }
@@ -241,6 +278,8 @@ pub struct OpenDocument {
     pub repo_ref: String,
     pub lang: Option<String>,
     pub content: String,
+    pub line_end_indices: Vec<u32>,
+    pub indexed: bool,
 }
 
 #[async_trait]
@@ -278,6 +317,7 @@ impl DocumentRead for OpenReader {
     {
         Compiler::new()
             .literal(schema.repo_name, |q| q.repo.clone())
+            .literal(schema.branches, |q| q.branch.clone())
             .literal(schema.relative_path, |q| match &q.path {
                 // We coerce path searches to always return sibling files. These are sorted later
                 // by users of this reader.
@@ -289,7 +329,7 @@ impl DocumentRead for OpenReader {
                 }
                 _ => None,
             })
-            .byte_string(schema.lang, |q| q.lang.as_ref())
+            .byte_string(schema.lang, |q| q.lang.as_ref().map(AsRef::as_ref))
             .compile(queries, tantivy_index)
     }
 
@@ -299,6 +339,15 @@ impl DocumentRead for OpenReader {
         let repo_ref = read_text_field(&doc, schema.repo_ref);
         let lang = read_lang_field(&doc, schema.lang);
         let content = read_text_field(&doc, schema.content);
+        let line_end_indices = doc
+            .get_first(schema.line_end_indices)
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let indexed = read_bool_field(&doc, schema.indexed);
 
         Self::Document {
             relative_path,
@@ -306,6 +355,8 @@ impl DocumentRead for OpenReader {
             repo_ref,
             lang,
             content,
+            line_end_indices,
+            indexed,
         }
     }
 }
@@ -318,13 +369,19 @@ impl DocumentRead for OpenReader {
 /// - `"bar/" -> "bar/"`
 /// - `"foo.txt" -> ""`
 pub fn base_name(path: &str) -> &str {
-    path.rfind(MAIN_SEPARATOR)
-        .map(|i| &path[..i + 1])
-        .unwrap_or("")
+    path.rfind('/').map(|i| &path[..i + 1]).unwrap_or("")
+}
+
+fn read_bool_field(doc: &tantivy::Document, field: Field) -> bool {
+    doc.get_first(field).unwrap().as_bool().unwrap()
 }
 
 fn read_text_field(doc: &tantivy::Document, field: Field) -> String {
-    doc.get_first(field).unwrap().as_text().unwrap().to_owned()
+    let Some(field) = doc.get_first(field) else {
+        return Default::default();
+    };
+
+    field.as_text().unwrap().into()
 }
 
 fn read_lang_field(doc: &tantivy::Document, lang: Field) -> Option<String> {
@@ -350,9 +407,8 @@ mod test {
 
     #[test]
     fn test_base_name() {
-        let s = MAIN_SEPARATOR;
-        assert_eq!(base_name(&format!("bar{s}foo.txt")), format!("bar{s}"));
-        assert_eq!(base_name(&format!("bar{s}")), format!("bar{s}"));
+        assert_eq!(base_name("bar/foo.txt"), format!("bar/"));
+        assert_eq!(base_name("bar/"), format!("bar/"));
         assert_eq!(base_name("foo.txt"), "");
     }
 }

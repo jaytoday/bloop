@@ -1,12 +1,13 @@
 use std::{collections::HashSet, hash::Hash, time::Duration};
 
 use crate::{
-    repo::{Backend, RepoRef, Repository, SyncStatus},
+    background::{QueuedRepoStatus, SyncConfig},
+    repo::{Backend, BranchFilterConfig, FileFilterConfig, RepoRef, Repository, SyncStatus},
     state::RepositoryPool,
     Application,
 };
 use axum::{
-    extract::{Path, Query},
+    extract::{Query, State},
     http::StatusCode,
     response::{sse, IntoResponse, Sse},
     Extension, Json,
@@ -14,10 +15,16 @@ use axum::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::prelude::*;
+use super::{middleware::User, prelude::*};
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(crate) struct Branch {
+    last_commit_unix_secs: i64,
+    name: String,
+}
 
 #[derive(Serialize, Debug, Eq)]
-pub(super) struct Repo {
+pub struct Repo {
     pub(super) provider: Backend,
     pub(super) name: String,
     #[serde(rename = "ref")]
@@ -27,17 +34,105 @@ pub(super) struct Repo {
     pub(super) last_update: DateTime<Utc>,
     pub(super) last_index: Option<DateTime<Utc>>,
     pub(super) most_common_lang: Option<String>,
+    pub(super) branch_filter: BranchFilterConfig,
+    pub(super) file_filter: FileFilterConfig,
+    pub(super) branches: Vec<Branch>,
 }
 
 impl From<(&RepoRef, &Repository)> for Repo {
     fn from((key, repo): (&RepoRef, &Repository)) -> Self {
+        let (head, branches) = 'branch_list: {
+            let default = ("HEAD".to_string(), vec![]);
+            let Ok(git) = gix::open(&repo.disk_path) else {
+                break 'branch_list default;
+            };
+
+            let head = git
+                .head()
+                .ok()
+                .and_then(|head| head.try_into_referent())
+                .map(|r| {
+                    if key.is_local() {
+                        r.name().shorten().to_string()
+                    } else {
+                        format!("origin/{}", r.name().shorten())
+                    }
+                })
+                .unwrap_or_else(|| default.0.clone());
+
+            let Ok(refs) = git.references() else {
+                break 'branch_list default;
+            };
+
+            let Ok(refs) = refs.all() else {
+                break 'branch_list default;
+            };
+
+            let branches = if key.is_local() {
+                vec![]
+            } else {
+                use gix::bstr::ByteSlice;
+                let mut branches = refs
+                    .filter_map(Result::ok)
+                    .filter_map(|mut r| {
+                        let name = r.name().shorten().to_str_lossy().to_string();
+                        let last_commit_unix_secs = r
+                            .peel_to_id_in_place()
+                            .ok()?
+                            .object()
+                            .ok()?
+                            .try_into_commit()
+                            .ok()?
+                            .time()
+                            .ok()?
+                            .seconds;
+
+                        Some(Branch {
+                            name,
+                            last_commit_unix_secs,
+                        })
+                    })
+                    .filter(|b| {
+                        if key.is_remote() {
+                            b.name != "origin/HEAD" && b.name.starts_with("origin/")
+                        } else {
+                            b.name != "HEAD" && !b.name.starts_with("origin/")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                branches.sort_by_key(|b| b.last_commit_unix_secs);
+                branches
+            };
+
+            (head, branches)
+        };
+
+        tracing::trace!(?branches, "branches");
+
+        let branch_filter = {
+            use BranchFilterConfig::*;
+            match repo.branch_filter.clone() {
+                Some(All) => Select(vec![".*".to_string()]),
+                Some(Head) => Select(vec![head]),
+                Some(Select(mut list)) => {
+                    if let Some(pos) = list.iter().position(|i| i == &head) {
+                        list.remove(pos);
+                    }
+                    list.insert(0, head);
+                    Select(list)
+                }
+                None => Select(vec![head]),
+            }
+        };
+
         Repo {
             provider: key.backend(),
-            name: key.display_name(),
+            name: key.indexed_name(),
             repo_ref: key.clone(),
-            sync_status: repo.sync_status.clone(),
+            sync_status: repo.pub_sync_status.clone(),
             local_duplicates: vec![],
-            last_update: NaiveDateTime::from_timestamp_opt(repo.last_commit_unix_secs as i64, 0)
+            last_update: NaiveDateTime::from_timestamp_opt(repo.last_commit_unix_secs, 0)
                 .unwrap()
                 .and_local_timezone(Utc)
                 .unwrap(),
@@ -51,6 +146,9 @@ impl From<(&RepoRef, &Repository)> for Repo {
                 ),
             },
             most_common_lang: repo.most_common_lang.clone(),
+            file_filter: repo.file_filter.clone(),
+            branch_filter,
+            branches,
         }
     }
 }
@@ -70,6 +168,9 @@ impl Repo {
             last_update: origin.pushed_at.unwrap(),
             last_index: None,
             most_common_lang: None,
+            branch_filter: crate::repo::BranchFilterConfig::Select(vec![]),
+            file_filter: Default::default(),
+            branches: vec![],
         }
     }
 }
@@ -86,16 +187,41 @@ impl PartialEq for Repo {
     }
 }
 
+// since it's an output type, there's no downside to having
+// excessively large variants
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ReposResponse {
+pub(crate) enum ReposResponse {
     List(Vec<Repo>),
     Item(Repo),
+    SyncQueue(Vec<QueuedRepoStatus>),
     SyncQueued,
+    #[cfg(feature = "ee-pro")]
+    Unchanged,
     Deleted,
 }
 
 impl super::ApiResponse for ReposResponse {}
+
+#[allow(unused_mut)]
+pub(super) fn router() -> Router {
+    use axum::routing::*;
+
+    let mut indexed = get(indexed).put(set_indexed).delete(delete_by_id);
+
+    #[cfg(feature = "ee-pro")]
+    {
+        indexed = indexed.patch(crate::ee::webserver::patch_repository);
+    }
+
+    Router::new()
+        .route("/", get(available))
+        .route("/queue", get(queue))
+        .route("/status", get(index_status))
+        .route("/indexed", indexed)
+        .route("/sync", get(sync).delete(delete_sync))
+}
 
 /// Get a stream of status notifications about the indexing of each repository
 /// This endpoint opens an SSE stream
@@ -104,10 +230,10 @@ pub(super) async fn index_status(Extension(app): Extension<Application>) -> impl
     let mut receiver = app.sync_queue.subscribe();
 
     Sse::new(async_stream::stream! {
-        while let Ok(event) = receiver.recv().await {
-            yield sse::Event::default().json_data(event).map_err(|err| {
-                <_ as Into<Box<dyn std::error::Error + Send + Sync>>>::into(err)
-            });
+        loop {
+            if let Ok(event) = receiver.recv().await {
+                yield sse::Event::default().json_data(event).map_err(Box::new);
+            }
         }
     })
     .keep_alive(
@@ -117,34 +243,61 @@ pub(super) async fn index_status(Extension(app): Extension<Application>) -> impl
     )
 }
 
+#[derive(Deserialize)]
+pub(super) struct IndexedParams {
+    repo: Option<RepoRef>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RepoParams {
+    pub(crate) repo: RepoRef,
+    #[serde(default)]
+    pub(crate) shallow: bool,
+}
+
+/// Live report of the state of the sync queue
+//
+pub(super) async fn queue(State(app): State<Application>) -> impl IntoResponse {
+    json(ReposResponse::SyncQueue(app.sync_queue.read_queue().await))
+}
+
 /// Retrieve all indexed repositories
 //
-pub(super) async fn indexed(Extension(app): Extension<Application>) -> impl IntoResponse {
+pub(super) async fn indexed(
+    Query(IndexedParams { repo }): Query<IndexedParams>,
+    app: State<Application>,
+) -> Result<impl IntoResponse> {
+    if let Some(repo) = repo {
+        return get_by_id(
+            Query(RepoParams {
+                repo,
+                shallow: false,
+            }),
+            app,
+        )
+        .await;
+    }
+
     let mut repos = vec![];
-    app.repo_pool
+    app.0
+        .repo_pool
         .scan_async(|k, v| repos.push(Repo::from((k, v))))
         .await;
 
-    json(ReposResponse::List(repos))
+    Ok(json(ReposResponse::List(repos)))
 }
 
 /// Get details of an indexed repository based on their id
 pub(super) async fn get_by_id(
-    Path(path): Path<Vec<String>>,
-    Extension(app): Extension<Application>,
-) -> Result<impl IntoResponse> {
-    let Ok(reporef) = RepoRef::from_components(&app.config.source.directory(), path) else {
-        return Err(Error::new(ErrorKind::NotFound, "Can't find repository"));
-    };
-
+    Query(RepoParams { repo, .. }): Query<RepoParams>,
+    State(app): State<Application>,
+) -> Result<Json<super::Response<'static>>> {
     match app
         .repo_pool
-        .read_async(&reporef, |k, v| {
-            json(ReposResponse::Item(Repo::from((k, v))))
-        })
+        .read_async(&repo, |k, v| ReposResponse::Item(Repo::from((k, v))))
         .await
     {
-        Some(result) => Ok(result),
+        Some(result) => Ok(json(result)),
         None => Err(Error::new(ErrorKind::NotFound, "Can't find repository")),
     }
 }
@@ -152,48 +305,59 @@ pub(super) async fn get_by_id(
 /// Delete a repository from the disk and any indexes
 //
 pub(super) async fn delete_by_id(
-    Path(path): Path<Vec<String>>,
-    Extension(app): Extension<Application>,
-) -> impl IntoResponse {
-    let Ok(reporef) = RepoRef::from_components(&app.config.source.directory(), path) else {
-        return Err(Error::new(ErrorKind::NotFound, "Can't find repository"));
-    };
+    Query(RepoParams { repo, .. }): Query<RepoParams>,
+    State(app): State<Application>,
+    Extension(user): Extension<User>,
+) -> Result<impl IntoResponse> {
+    // TODO: We can refactor `repo_pool` to also hold queued repos, instead of doing a calculation
+    // like this which is prone to timing issues.
+    let num_repos = app.repo_pool.len();
+    let found = app.write_index().remove(repo).await.is_some();
+    let num_deleted = if found { 1 } else { 0 };
 
-    match app.write_index().remove(reporef).await {
-        Some(_) => Ok(json(ReposResponse::Deleted)),
-        None => Err(Error::new(ErrorKind::NotFound, "Repo not found")),
+    app.with_analytics(|analytics| {
+        analytics.track_synced_repos(num_repos - num_deleted, user.username(), user.org_name());
+    });
+
+    if found {
+        Ok(json(ReposResponse::Deleted))
+    } else {
+        Err(Error::new(ErrorKind::NotFound, "Repo not found"))
     }
 }
 
 /// Synchronize a repo by its id
 pub(super) async fn sync(
-    Path(path): Path<Vec<String>>,
-    Extension(app): Extension<Application>,
-) -> impl IntoResponse {
-    let Ok(reporef) = RepoRef::from_components(&app.config.source.directory(), path) else {
-        return Err(Error::new(ErrorKind::NotFound, "Can't find repository"));
-    };
+    Query(RepoParams { repo, shallow }): Query<RepoParams>,
+    State(app): State<Application>,
+    Extension(user): Extension<User>,
+) -> Result<impl IntoResponse> {
+    // TODO: We can refactor `repo_pool` to also hold queued repos, instead of doing a calculation
+    // like this which is prone to timing issues.
+    let num_repos = app.repo_pool.len();
+    app.write_index()
+        .enqueue(SyncConfig::new(app.clone(), repo).shallow(shallow))
+        .await;
 
-    app.write_index().sync_and_index(vec![reporef]).await;
+    app.with_analytics(|analytics| {
+        analytics.track_synced_repos(num_repos + 1, user.username(), user.org_name());
+    });
+
     Ok(json(ReposResponse::SyncQueued))
 }
 
 /// Synchronize a repo by its id
 pub(super) async fn delete_sync(
-    Path(path): Path<Vec<String>>,
-    Extension(app): Extension<Application>,
-) -> impl IntoResponse {
-    let Ok(reporef) = RepoRef::from_components(&app.config.source.directory(), path) else {
-        return Err(Error::new(ErrorKind::NotFound, "Can't find repository"));
-    };
-
-    app.write_index().cancel(reporef).await;
+    Query(RepoParams { repo, .. }): Query<RepoParams>,
+    State(app): State<Application>,
+) -> Result<impl IntoResponse> {
+    app.write_index().cancel(repo).await;
     Ok(json(ReposResponse::SyncQueued))
 }
 
 /// List all repositories that are either indexed, or available for indexing
 //
-pub(super) async fn available(Extension(app): Extension<Application>) -> impl IntoResponse {
+pub(super) async fn available(State(app): State<Application>) -> impl IntoResponse {
     let unknown_github = app
         .credentials
         .github()
@@ -242,10 +406,15 @@ pub(super) struct SetIndexed {
 /// This will automatically trigger a sync of currently un-indexed repositories.
 //
 pub(super) async fn set_indexed(
-    Extension(app): Extension<Application>,
+    State(app): State<Application>,
+    Extension(user): Extension<User>,
     Json(new_list): Json<SetIndexed>,
 ) -> impl IntoResponse {
     let mut repo_list = new_list.indexed.into_iter().collect::<HashSet<_>>();
+
+    app.with_analytics(|analytics| {
+        analytics.track_synced_repos(repo_list.len(), user.username(), user.org_name());
+    });
 
     app.repo_pool
         .for_each_async(|k, existing| {
@@ -257,7 +426,7 @@ pub(super) async fn set_indexed(
         .await;
 
     app.write_index()
-        .sync_and_index(repo_list.into_iter().collect())
+        .enqueue_all(repo_list.into_iter().collect())
         .await;
 
     json(ReposResponse::SyncQueued)
@@ -273,7 +442,7 @@ pub(super) struct ScanRequest {
 ///
 pub(super) async fn scan_local(
     Query(scan_request): Query<ScanRequest>,
-    Extension(app): Extension<Application>,
+    State(app): State<Application>,
 ) -> impl IntoResponse {
     let root = std::path::Path::new(&scan_request.path);
 
@@ -334,7 +503,12 @@ mod test {
                     sync_status: SyncStatus::Done,
                     last_commit_unix_secs: 123456,
                     last_index_unix_secs: 123456,
-                    most_common_lang: None,
+                    most_common_lang: Default::default(),
+                    branch_filter: Default::default(),
+                    file_filter: Default::default(),
+                    pub_sync_status: Default::default(),
+                    locked: Default::default(),
+                    shallow: Default::default(),
                 },
             )
             .unwrap();
@@ -351,7 +525,12 @@ mod test {
                     sync_status: SyncStatus::Done,
                     last_commit_unix_secs: 123456,
                     last_index_unix_secs: 123456,
-                    most_common_lang: None,
+                    most_common_lang: Default::default(),
+                    branch_filter: Default::default(),
+                    file_filter: Default::default(),
+                    pub_sync_status: Default::default(),
+                    locked: Default::default(),
+                    shallow: Default::default(),
                 },
             )
             .unwrap();
@@ -370,7 +549,12 @@ mod test {
                     sync_status: SyncStatus::Uninitialized,
                     last_commit_unix_secs: 123456,
                     last_index_unix_secs: 0,
-                    most_common_lang: None,
+                    most_common_lang: Default::default(),
+                    branch_filter: Default::default(),
+                    file_filter: Default::default(),
+                    pub_sync_status: Default::default(),
+                    locked: Default::default(),
+                    shallow: Default::default(),
                 },
             )
                 .into(),
@@ -388,7 +572,12 @@ mod test {
                 sync_status: SyncStatus::Uninitialized,
                 last_commit_unix_secs: 123456,
                 last_index_unix_secs: 0,
-                most_common_lang: None,
+                most_common_lang: Default::default(),
+                branch_filter: Default::default(),
+                file_filter: Default::default(),
+                pub_sync_status: Default::default(),
+                locked: Default::default(),
+                shallow: Default::default(),
             },
         )
             .into();

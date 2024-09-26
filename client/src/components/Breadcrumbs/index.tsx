@@ -1,28 +1,43 @@
-import {
+import React, {
   Fragment,
   MouseEvent,
   ReactElement,
+  useCallback,
   useEffect,
   useRef,
   useState,
+  ClipboardEvent,
+  memo,
 } from 'react';
 import { Range } from '../../types/results';
+import { copyToClipboard, isWindowsPath } from '../../utils';
 import BreadcrumbSection from './BreadcrumbSection';
 import BreadcrumbsCollapsed from './BreadcrumbsCollapsed';
 
-export type PathParts = {
+type HighlightedString = {
   label: string;
-  icon?: ReactElement<any, any>;
-  link?: string;
-  onClick?: (e: MouseEvent<HTMLButtonElement>) => void;
   highlight?: Range;
 };
+
+type ItemElement = {
+  label: ReactElement<any, any>;
+  highlight?: never;
+};
+
+export type PathParts = {
+  icon?: ReactElement<any, any>;
+  link?: string;
+  onClick?: (e?: MouseEvent) => void;
+  underline?: boolean;
+} & (HighlightedString | ItemElement);
 
 type Props = {
   pathParts: PathParts[];
   path: string;
   separator?: string;
   limitSectionWidth?: boolean;
+  allowOverflow?: boolean;
+  nonInteractive?: boolean;
   type?: 'link' | 'button';
   activeStyle?: 'primary' | 'secondary';
 };
@@ -32,13 +47,17 @@ const Breadcrumbs = ({
   separator = '/',
   type = 'link',
   limitSectionWidth,
+  nonInteractive,
+  path,
+  allowOverflow,
 }: Props) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [formattedPathParts, setFormattedPathParts] =
     useState<(PathParts | PathParts[])[]>(pathParts);
 
   useEffect(() => {
-    if (!containerRef.current) {
+    if (!containerRef.current || allowOverflow) {
+      setFormattedPathParts(pathParts);
       return;
     }
     const parentWidth = containerRef.current.parentElement!.clientWidth;
@@ -73,18 +92,37 @@ const Breadcrumbs = ({
       }
     }
     setFormattedPathParts(partsToShow);
-  }, [pathParts]);
+  }, [pathParts, allowOverflow]);
+
+  const onCopy = useCallback(
+    (e: ClipboardEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      copyToClipboard(
+        document
+          .getSelection()
+          ?.toString()
+          .split(separator)
+          .map((part) => part.trim())
+          .join(isWindowsPath(path) ? '\\' : '/') || '',
+      );
+    },
+    [path],
+  );
 
   return (
-    <div className="flex items-center body-s flex-shrink-0 gap-1.5">
+    <div
+      className="flex items-center body-s flex-shrink-0 gap-1.5"
+      onCopy={onCopy}
+    >
       {/* this div is hidden and used only to calculate the full width of breadcrumbs before truncation */}
       <div
-        className="fixed top-full opacity-0 left-0 flex flex-nowrap items-center body-s flex-shrink-0 gap-1.5"
+        className="fixed top-full opacity-0 left-0 flex flex-nowrap items-center body-s flex-shrink-0 gap-1.5 select-none"
         ref={containerRef}
       >
         {pathParts.map((p, i) => (
           <Fragment key={i}>
             <span className={`flex items-center gap-1 flex-shrink-0`}>
+              {/*// @ts-ignore*/}
               <BreadcrumbSection
                 icon={p.icon}
                 label={p.label}
@@ -109,6 +147,7 @@ const Breadcrumbs = ({
             <BreadcrumbsCollapsed items={p} type={type} />
           ) : (
             <span className={`flex items-center gap-1 flex-shrink-0`}>
+              {/*// @ts-ignore*/}
               <BreadcrumbSection
                 icon={p.icon}
                 label={p.label}
@@ -117,6 +156,7 @@ const Breadcrumbs = ({
                 isLast={i == formattedPathParts.length - 1}
                 type={type}
                 limitSectionWidth={limitSectionWidth}
+                nonInteractive={nonInteractive}
               />
             </span>
           )}
@@ -131,4 +171,4 @@ const Breadcrumbs = ({
   );
 };
 
-export default Breadcrumbs;
+export default memo(Breadcrumbs);

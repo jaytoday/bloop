@@ -1,20 +1,22 @@
 import React, {
   ChangeEvent,
+  memo,
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useState,
 } from 'react';
-import ModalOrSidebar from '../ModalOrSidebar';
-import { Bug, CloseSign } from '../../icons';
+import { useTranslation, Trans } from 'react-i18next';
+import Modal from '../../components/Modal';
+import { CloseSignIcon } from '../../icons';
 import TextInput from '../TextInput';
 import Button from '../Button';
 import { UIContext } from '../../context/uiContext';
-import { EMAIL_REGEX } from '../../consts/validations';
 import { saveBugReport, saveCrashReport } from '../../services/api';
 import { DeviceContext } from '../../context/deviceContext';
-import { TabsContext } from '../../context/tabsContext';
-import ConfirmImg from './ConfirmImg';
+import { getJsonFromStorage, USER_DATA_FORM } from '../../services/storage';
+import { EnvContext } from '../../context/envContext';
 
 type Props = {
   errorBoundaryMessage?: string;
@@ -26,18 +28,34 @@ const ReportBugModal = ({
   handleSubmit,
   forceShow,
 }: Props) => {
+  const { t } = useTranslation();
   const [form, setForm] = useState({
     name: '',
     email: '',
     text: '',
     emailError: '',
   });
-  const [isSubmitted, setSubmitted] = useState(false);
+  const [serverLog, setServerLog] = useState('');
   const [serverCrashedMessage, setServerCrashedMessage] = useState('');
-  const { onBoardingState, isBugReportModalOpen, setBugReportModalOpen } =
-    useContext(UIContext);
-  const { envConfig, listen, os } = useContext(DeviceContext);
-  const { handleRemoveTab, setActiveTab, activeTab } = useContext(TabsContext);
+  const { isBugReportModalOpen, setBugReportModalOpen } = useContext(
+    UIContext.BugReport,
+  );
+  const { listen, os, release, invokeTauriCommand } = useContext(DeviceContext);
+  const { envConfig } = useContext(EnvContext);
+
+  const userForm = useMemo(
+    (): { email: string; firstName: string; lastName: string } | null =>
+      getJsonFromStorage(USER_DATA_FORM),
+    [],
+  );
+
+  useEffect(() => {
+    if (isBugReportModalOpen) {
+      invokeTauriCommand('get_last_log_file').then((log) => {
+        setServerLog(log);
+      });
+    }
+  }, [isBugReportModalOpen]);
 
   useEffect(() => {
     listen('server-crashed', (event) => {
@@ -54,14 +72,12 @@ const ReportBugModal = ({
   }, [errorBoundaryMessage]);
 
   useEffect(() => {
-    const savedForm = onBoardingState['STEP_DATA_FORM'];
-
     setForm((prev) => ({
       ...prev,
-      name: (savedForm?.firstName || '') + (savedForm?.lastName || ''),
-      email: savedForm?.email || '',
+      name: (userForm?.firstName || '') + (userForm?.lastName || ''),
+      email: userForm?.email || '',
     }));
-  }, [onBoardingState]);
+  }, [userForm]);
 
   const onChange = useCallback(
     (e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -78,165 +94,131 @@ const ReportBugModal = ({
     (e: React.MouseEvent<HTMLButtonElement, MouseEvent>) => {
       e.preventDefault();
       if (serverCrashedMessage) {
+        const userData: {
+          email: string;
+          firstName: string;
+          lastName: string;
+        } | null = getJsonFromStorage(USER_DATA_FORM);
         saveCrashReport({
           text: form.text,
+          name: userData
+            ? `${userData.firstName} ${userData.lastName}`
+            : undefined,
+          email: userData?.email,
           unique_id: envConfig.tracking_id || '',
           info: serverCrashedMessage,
           metadata: JSON.stringify(os),
+          app_version: release,
+          server_log: serverLog,
         });
       } else {
         const { emailError, ...values } = form;
-        saveBugReport({ ...values, unique_id: envConfig.tracking_id || '' });
+        saveBugReport({
+          ...values,
+          unique_id: envConfig.tracking_id || '',
+          app_version: release,
+          metadata: JSON.stringify(os),
+          server_log: serverLog,
+        });
       }
-      setSubmitted(true);
+      resetState();
     },
-    [],
+    [form, envConfig.tracking_id, release, serverLog],
   );
   const resetState = useCallback(() => {
     if (serverCrashedMessage) {
-      handleRemoveTab(activeTab);
-      setActiveTab('initial');
+      console.log('go to empty page');
     }
     setForm((prev) => ({ ...prev, text: '', emailError: '' }));
-    setSubmitted(false);
     setBugReportModalOpen(false);
     setServerCrashedMessage('');
     handleSubmit?.();
-  }, [handleRemoveTab, setActiveTab, serverCrashedMessage, activeTab]);
+  }, [serverCrashedMessage]);
 
   return (
-    <ModalOrSidebar
-      isSidebar={false}
-      shouldShow={isBugReportModalOpen || !!forceShow}
+    <Modal
+      isVisible={isBugReportModalOpen || !!forceShow}
       onClose={() => setBugReportModalOpen(false)}
-      isModalSidebarTransition={false}
-      setIsModalSidebarTransition={() => {}}
-      shouldStretch={false}
-      fullOverlay
-      containerClassName="max-w-md2 max-h-[80vh]"
+      containerClassName="max-w-lg max-h-[80vh]"
     >
-      <div className="p-6 flex flex-col gap-8 relative bg-bg-shade overflow-auto">
-        {!isSubmitted ? (
-          serverCrashedMessage ? (
-            <>
-              <div className="flex flex-col gap-3 items-center">
-                <h4 className="text-label-title">bloop crashed unexpectedly</h4>
-                <p className="body-s text-label-base text-center">
-                  By submitting this crash report you agree to send it to bloop
-                  for investigation.
-                </p>
-              </div>
-              <form className="flex flex-col gap-4 overflow-auto">
-                <TextInput
-                  value={form.text}
-                  onChange={onChange}
-                  name="text"
-                  multiline
-                  variant="filled"
-                  placeholder="Provide any steps necessary to reproduce the problem..."
-                />
-                <div className="flex flex-col overflow-auto">
-                  <p className="body-s text-label-title mb-1">
-                    Problem details and System configuration
-                  </p>
-                  <p className="body-s text-label-base border border-bg-border p-2.5 rounded-4 overflow-auto">
-                    {serverCrashedMessage}
-                    <br />
-                    <br />
-                    Type: {os.type}
-                    <br />
-                    Platform: {os.platform}
-                    <br />
-                    Arch: {os.arch}
-                    <br />
-                    Version: {os.version}
-                    <br />
-                  </p>
-                </div>
-              </form>
-              <Button type="submit" onClick={onSubmit}>
-                Submit crash report
-              </Button>
-            </>
-          ) : (
-            <>
-              <div className="flex flex-col gap-3 items-center text-label-title">
-                <Bug />
-                <h4>Report a bug</h4>
-                <p className="body-s text-label-base text-center">
-                  We want to make this the best experience for you. If you
-                  encountered a bug, please submit this bug report to us. Our
-                  team will investigate as soon as possible.
-                </p>
-              </div>
-              <form className="flex flex-col gap-4">
-                <TextInput
-                  value={form.name}
-                  onChange={onChange}
-                  name="name"
-                  variant="filled"
-                  placeholder="Full name"
-                />
-                <TextInput
-                  value={form.email}
-                  onChange={onChange}
-                  validate={() => {
-                    if (!EMAIL_REGEX.test(form.email)) {
-                      setForm((prev) => ({
-                        ...prev,
-                        emailError: 'Email is not valid',
-                      }));
-                    }
-                  }}
-                  error={form.emailError}
-                  name="email"
-                  variant="filled"
-                  placeholder="Email address"
-                />
-                <TextInput
-                  value={form.text}
-                  onChange={onChange}
-                  name="text"
-                  multiline
-                  variant="filled"
-                  placeholder="Describe the bug to help us reproduce it..."
-                />
-              </form>
-              <Button type="submit" onClick={onSubmit}>
-                Submit bug report
-              </Button>
-            </>
-          )
-        ) : (
-          <>
-            <div className="flex flex-col gap-3 items-center">
-              <h4>Thank you!</h4>
-              <p className="body-s text-label-base text-center">
-                We’ll investigate and reach out back soon if necessary.
-              </p>
-            </div>
-            <div className="w-full">
-              <ConfirmImg />
-            </div>
-            <Button variant="secondary" onClick={resetState}>
-              Got it!
-            </Button>
-          </>
-        )}
-        <div className="absolute top-2 right-2">
+      <div className="flex flex-col relative bg-bg-shade overflow-auto">
+        <div className="flex h-13 px-3 items-center justify-between border-b border-bg-border">
+          <p className="title-s select-none text-label-title">
+            {serverCrashedMessage ? (
+              <Trans>bloop crashed unexpectedly</Trans>
+            ) : (
+              <Trans>Report a bug</Trans>
+            )}
+          </p>
           <Button
             onlyIcon
-            title="Close"
+            title={t`Close`}
             variant="tertiary"
             size="small"
             onClick={resetState}
           >
-            <CloseSign />
+            <CloseSignIcon sizeClassName="w-3.5 h-3.5" />
+          </Button>
+        </div>
+        <div className="flex flex-col p-3 gap-4 overflow-auto">
+          <p className="select-none body-base text-label-base">
+            {serverCrashedMessage ? (
+              <Trans>
+                By submitting this crash report you agree to send it to bloop
+                for investigation.
+              </Trans>
+            ) : (
+              <Trans>
+                We want to make this the best experience for you. If you
+                encountered a bug, please submit this bug report to us. Our team
+                will investigate as soon as possible.
+              </Trans>
+            )}
+          </p>
+          <TextInput
+            value={form.text}
+            onChange={onChange}
+            name="text"
+            multiline
+            placeholder={t`Provide any steps necessary to reproduce the problem...`}
+          />
+          {!!serverCrashedMessage && (
+            <div>
+              <p className="body-s-b text-label-title mb-2">
+                <Trans>Problem details and System configuration</Trans>
+              </p>
+              <p className="body-s-b text-label-title p-3 rounded-6 bg-bg-base overflow-auto">
+                {serverCrashedMessage}
+                <br />
+                <br />
+                Type: {os.type}
+                <br />
+                Platform: {os.platform}
+                <br />
+                Arch: {os.arch}
+                <br />
+                Version: {os.version}
+                <br />
+              </p>
+            </div>
+          )}
+        </div>
+        <div className="flex items-center px-3 gap-3 justify-end border-t border-bg-border h-13">
+          <Button variant="tertiary" size="small" onClick={resetState}>
+            <Trans>Cancel</Trans>
+          </Button>
+          <Button
+            variant="primary"
+            size="small"
+            onClick={onSubmit}
+            disabled={!form.text && !serverCrashedMessage}
+          >
+            <Trans>Submit bug report</Trans>
           </Button>
         </div>
       </div>
-    </ModalOrSidebar>
+    </Modal>
   );
 };
 
-export default ReportBugModal;
+export default memo(ReportBugModal);
